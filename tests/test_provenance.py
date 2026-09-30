@@ -72,3 +72,40 @@ class Provenance(unittest.TestCase):
                 self.assertFalse(s.begin_timed_run(0,'1'))
             self.assertEqual(s.state,'IDLE');self.assertFalse(s.ser.writes)
             self.assertIsNone(s._record_file);self.assertIsNone(s._peak_file)
+    def test_initial_manifest_and_first_close_failure_clean_every_stream(self):
+        import contextlib
+        import io
+        from helpers import ready
+        with tempfile.TemporaryDirectory() as d:
+            s=link();ready(s)
+            allocate=logger.open_unique_session
+            owned=[]
+            close_attempts=[]
+            def reserve(directory,base):
+                paths,files=allocate(directory,base)
+                owned.extend(files)
+                class Stream:
+                    def __init__(self,index):self.index=index
+                    def __getattr__(self,name):return getattr(files[self.index],name)
+                    def close(self):
+                        close_attempts.append(self.index)
+                        files[self.index].close()
+                        if self.index==0:raise OSError('sample close also failed')
+                return paths,[Stream(i) for i in range(3)]
+            output=io.StringIO()
+            with patch.object(logger,'RECORDINGS_DIR',d), \
+                    patch.object(logger,'open_unique_session',reserve), \
+                    patch.object(s,'_save_manifest',side_effect=OSError('initial manifest failed')), \
+                    contextlib.redirect_stdout(output):
+                self.assertFalse(s.begin_timed_run(0,'1'))
+            self.assertEqual(s.state,'IDLE');self.assertFalse(s.ser.writes)
+            self.assertFalse(s._heartbeat_enabled);self.assertFalse(s._record_started)
+            for field in ('_record_file','_peak_file','_record_writer','_peak_writer',
+                          '_record_path','_peak_path','_manifest_path',
+                          '_record_expected_preset','_detector','manifest'):
+                self.assertIsNone(getattr(s,field),field)
+            self.assertTrue(all(stream.closed for stream in owned))
+            self.assertEqual(close_attempts,[2,0,1,2])
+            self.assertIn('initial manifest failed',output.getvalue())
+            self.assertIn('sample close also failed',output.getvalue())
+            self.assertIn('partial allocation files retained',output.getvalue())

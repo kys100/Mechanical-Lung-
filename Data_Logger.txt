@@ -599,10 +599,13 @@ class SerialLink:
         elif parts == ['READY_QUERY']:
             # Legacy is display-only. Timed acquisition checks v2 + metadata.
             if (self.protocol_version is None and self.state != 'FAULTED') or self.metadata is not None:
-                self._ready_event.set()
                 with self._run_lock:
-                    if self.state == 'FAULTED' and self.metadata is not None:
-                        self.state = 'IDLE'
+                    if self.protocol_version == 2 and self.metadata is not None:
+                        self.connected = True
+                        self.connection_error = None
+                        if self.state == 'FAULTED':
+                            self.state = 'IDLE'
+                    self._ready_event.set()
         elif kind == 'ERROR':
             print(f'-> firmware error: {line[2:]}')
         elif kind == 'STARTED' and len(parts) == 6 and parts[1] == '2':
@@ -897,6 +900,7 @@ class SerialLink:
                 return None
             preset = self._last_preset if preset_index is None else preset_index
             base = f"{PRESET_NAMES.get(preset, 'unknown').replace('/', '-').replace(' ', '_')}_{time.strftime('%Y%m%d_%H%M%S')}"
+            paths, files = (), ()
             try:
                 paths, files = open_unique_session(RECORDINGS_DIR, base)
                 self._record_path, self._peak_path, self._manifest_path = paths
@@ -922,12 +926,25 @@ class SerialLink:
                 self.manifest['config_sha256'] = config_fingerprint(self.manifest)
                 self._save_manifest()
             except OSError as exc:
-                for stream in (self._record_file, self._peak_file):
-                    if stream is not None:
+                # A full disk can make close() fail while flushing headers.
+                # Attempt every owned stream, including the manifest handle,
+                # then relinquish all recording state before returning.
+                for stream in files:
+                    try:
                         stream.close()
+                    except OSError as close_error:
+                        print(f'-> storage fault closing failed allocation: {close_error}')
                 self._record_file = self._peak_file = None
                 self._record_writer = self._peak_writer = None
+                self._record_path = self._peak_path = self._manifest_path = None
+                self._record_expected_preset = None
+                self._record_started = False
+                self._detector = None
+                self.manifest = None
+                self._rows_written = self._run_bad_lines = self._run_dropped_rows = 0
                 print(f'-> storage fault allocating recording: {exc}')
+                if paths:
+                    print(f'-> partial allocation files retained: {paths}')
                 return None
             self._record_expected_preset = preset
             self._record_started = False

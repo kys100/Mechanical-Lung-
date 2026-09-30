@@ -177,3 +177,27 @@ class Control(unittest.TestCase):
             self.assertEqual(s.state,'FAULTED')
             self.assertEqual(s.manifest['termination_reason'],'transport_fault')
             self.assertIsNone(s._record_file);self.assertFalse(s._heartbeat_enabled)
+    def test_complete_fresh_handshake_restores_connection_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=link();recording(s,d)
+            original_write=s.ser.write
+            s.ser.write=lambda data:0
+            self.assertFalse(s.send_command('m'))
+            self.assertEqual(s.state,'FAULTED')
+            self.assertFalse(s.connected);self.assertIsNotNone(s.connection_error)
+            s.ser.write=original_write
+            self.assertTrue(s.send_command('?'))
+            self.assertEqual(s.ser.writes[-1],b'\n?')
+            s._handle_marker('# READY_QUERY')
+            self.assertEqual(s.state,'FAULTED');self.assertFalse(s.connected)
+            s._handle_marker('# PROTOCOL,2')
+            s._handle_marker('# META_BEGIN,2,reconnected')
+            for key in sorted(logger.META_KEYS):
+                s._handle_marker(f'# META,2,{key},test')
+            s._handle_marker('# READY_QUERY')
+            self.assertEqual(s.state,'FAULTED');self.assertFalse(s.connected)
+            s._handle_marker('# META_END,2,reconnected')
+            self.assertEqual(s.state,'FAULTED');self.assertFalse(s.connected)
+            s._handle_marker('# READY_QUERY')
+            self.assertEqual(s.state,'IDLE');self.assertTrue(s.connected)
+            self.assertIsNone(s.connection_error);self.assertTrue(s._ready_event.is_set())
