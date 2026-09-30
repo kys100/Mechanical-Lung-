@@ -1,90 +1,33 @@
 #!/usr/bin/env python3
+"""Mechanical lung serial logger. Run: python Data_Logger.txt --port PORT.
+
+Protocol 2 timed runs require a complete firmware metadata handshake. Captures
+include raw sample CSV, peak CSV and a session manifest for deterministic replay.
+Use H to request confirmed hold, p to discard a stopped session, q to close.
+Flow timestamps describe read completion; interpolation does not increase sensor
+precision. --avg controls segmentation; --peak-smooth independently defaults to 9.
+Measured flow is standard L/min. Targets are geometric local L/min unless measured
+run temperature and pressure are supplied together. See docs/analysis-policy.md.
 """
-Data Logger — companion to MechLung.ino
-
-What it does
-------------
-  - Opens the same serial link the Arduino Serial Monitor/Plotter would use.
-  - Sends the single-byte commands the sketch accepts:
-        1-4        preset profile — automatically starts a timed run
-        s / S      demo sine
-        H / h / 0  hold / idle
-        X / x      calibration hold
-        m / M      toggle the sketch's human-readable Monitor block
-        ?          reprint the sketch's banner / help
-    Handled locally, NOT sent to the board:
-        p          abort the active run and discard its partial files
-        q          quit
-    The logger also sends an internal heartbeat so a logger-controlled run
-    returns to centre if this process or its serial connection disappears.
-    Click on any plot window to give it focus, then press a key.
-
-  - Timed runs: selecting a preset automatically starts recording and a
-    --run-seconds countdown (default 180 seconds). At timeout, recording is
-    kept and the actuator is returned to centre. Pressing 'p' aborts early,
-    deletes that run's partial files, and returns the actuator to centre.
-    Switching manually to hold, calibration, or demo sine ends a run early
-    but keeps its recording.
-
-  - Reads the sketch's per-cycle "DATA,..." line (37 fields, see the
-    "# DATA line" banner MechLung.ino prints at boot) and live-plots it as
-    three separately-scaled windows:
-        1) Flow sensor      — raw + smoothed (moving average), autoscaled
-        2) Actuator command vs. measured feedback (% of stroke)
-        3) All 7 SDP811 pressure channels, autoscaled, with an ok-count
-           and average-temperature readout
-
-  - Each timed run writes TWO CSVs sharing one base name:
-
-        <preset>_<timestamp>.csv
-            Every parsed DATA row — host and board timestamps, flow, all 7
-            pressure channels and validity flags, average temperature,
-            actuator command/feedback in DAC counts and percent-of-stroke,
-            commanded flow/phase targets, per-sensor sample ages, preset,
-            and clamp status.
-
-        <preset>_<timestamp>_peaks.csv
-            ONE ROW PER DETECTED PEAK-FLOW EVENT. The live trailing-average
-            flow (--avg) is segmented into breath excursions by a
-            hysteresis threshold, so excursion start/end times can lag by
-            roughly half that live window; within each excursion the raw
-            flow is re-smoothed (--peak-smooth) with a
-            ZERO-LAG CENTRED moving average and the peak located on that,
-            so the pressures logged are the ones measured at the true
-            flow peak rather than one half-averaging-window late. Each
-            row carries the instantaneous 7-channel pressures at the peak
-            AND their means over the plateau (samples within
-            --peak-plateau of the peak), which is the more usable number
-            when the flow signal is noisy. It also reports target-flow error,
-            target pass/fail, sensor age/skew, pressure validity, and pressure
-            variation across the plateau. Initial breath cycles are retained
-            with `is_warmup=1`, and disjoint plateau samples are exposed with
-            `plateau_contiguous=0` for downstream CFD filtering.
-
-    Demo sine still plots live but is not automatically recorded.
-
-Requires: pyserial, matplotlib
-    pip install pyserial matplotlib
-
-Usage:
-    python "Data Logger"                            # prompts you to pick a port
-    python "Data Logger" --port COM5
-    python "Data Logger" --port /dev/ttyACM0 --avg 9 --window 30
-    python "Data Logger" --list-ports
-"""
-
 import argparse
 import bisect
 import csv
 import math
 import os
 import sys
+import json
+import re
+import secrets
+import hashlib
+import traceback
+from pathlib import Path
+from dataclasses import asdict
 import threading
 import time
 from collections import deque, namedtuple
 
 # PeakFlowDetector, PeakDetectionConfig and centred_moving_average are also
-# re-exported here: existing callers and test_data_logger.py access them as
+# re-exported here for import compatibility. Callers may access them as
 # attributes of this module (e.g. LOGGER.PeakFlowDetector).
 from peak_detection import (
     DEFAULT_MAX_SENSOR_AGE_MS,
@@ -95,6 +38,7 @@ from peak_detection import (
     PeakDetectionConfig,
     PeakFlowDetector,
     centred_moving_average,
+    standard_flow,
 )
 
 try:
@@ -161,6 +105,10 @@ Sample = namedtuple("Sample", [
     "pa", "temp", "pok", "pa_age_us", "cmd_dac", "feedback_dac",
     "cmd_pct", "fdbk_pct", "target_flow_slm", "target_peak_slm",
     "phase", "preset", "clamped",
+    "run_id", "scan_id", "row_us", "cycle_id", "scan_start_us",
+    "missed_slots_total", "tx_dropped_total", "row_time_us", "flow_time_us",
+    "pa_time_us", "segment_id", "discontinuity_reason", "target_reference_resolved",
+    "target_peak_local_lmin",
 ])
 
 
@@ -168,7 +116,7 @@ class MillisUnwrapper:
     """Convert the board's uint32 millis counter into monotonic seconds.
 
     Unsigned subtraction naturally handles the roughly 49.7-day wrap. A
-    backward jump larger than half the uint32 range is treated as a board
+    backward jump smaller than half the uint32 range is treated as a board
     reset and starts a new segment without making plotted time go backward.
     """
 
@@ -248,6 +196,108 @@ def pick_port():
         print("Invalid selection, try again.")
 
 
+META_KEYS = set('core tidal_ml bore_mm stroke_mm dac_centre dac_half_range dac_corr_offset dac_corr_gain pot_raw_centre pot_dac_per_adc calibration_target slot_us sfm_scale flow_reference'.split())
+SAMPLE_COLUMNS = ['wire_line'] + list(Sample._fields)
+PEAK_COLUMNS = ['peak_idx', 'seq', 'cycle_id', 'phase', 'direction', 'flow_peak_slm',
+                'plateau_reference_flow_slm', 'peak_time_s', 'peak_offset_s',
+                'interpolation_status', 'nearest_sample_seq', 'target_peak_slm',
+                'target_error_slm', 'target_error_pct', 'target_met', 'is_warmup',
+                'excursion_complete', 'pa_mean', 'pa_std', 'pa_ok_frac',
+                'pressure_all_ok', 'timing_ok', 'peak_sample_ok', 'plateau_capture_ok',
+                'qualified_peak', 'reason_codes', 'plateau_n', 'plateau_contiguous',
+                'max_pressure_age_us', 'pressure_age_span_us', 'flow_pressure_skew_us',
+                'plateau_span_s', 'excursion_n', 'excursion_s']
+
+
+def uint32(value):
+    result = int(value)
+    if not 0 <= result <= 0xffffffff:
+        raise ValueError('uint32 out of range')
+    return result
+
+
+def parse_wire(line):
+    p = line.split(',')
+    protocol = {'DATA': 1, 'DATA2': 2}.get(p[0])
+    if protocol is None or len(p) != (37 if protocol == 1 else 44):
+        raise ValueError('unknown DATA schema/width')
+    def finite(i):
+        value = float(p[i])
+        if not math.isfinite(value):
+            raise ValueError('nonfinite field')
+        return value
+    def flag(i):
+        if p[i] not in ('0', '1'):
+            raise ValueError('invalid flag')
+        return p[i] == '1'
+    def age(i, valid):
+        value = int(p[i])
+        if value < -1 or value > 0x7fffffff or (valid and value < 0):
+            raise ValueError('invalid age')
+        return value
+    flow_ok = flag(4)
+    pok = [flag(i) for i in range(14, 21)]
+    phase, preset, dac = int(p[34]), int(p[35]), int(p[28])
+    if phase not in (-1, 0, 1) or preset not in (-2, -1, 0, 1, 2, 3) or not 0 <= dac <= 4095:
+        raise ValueError('invalid phase/preset/DAC')
+    if (preset >= 0 and phase == -1) or (preset < 0 and phase != -1):
+        raise ValueError('phase/preset mismatch')
+    rid = p[37] if protocol == 2 else None
+    if protocol == 2 and not re.fullmatch('[0-9a-f]{16}', rid):
+        raise ValueError('invalid run ID')
+    return dict(protocol=protocol, seq=uint32(p[1]), ms=uint32(p[2]),
+                flow_raw=finite(3), flow_ok=flow_ok, flow_age_us=age(5, flow_ok),
+                pa=[finite(i) for i in range(6, 13)], temp=finite(13), pok=pok,
+                pa_age_us=[age(i, ok) for i, ok in zip(range(21, 28), pok)],
+                cmd_dac=dac, feedback_dac=finite(29), cmd_pct=finite(30), fdbk_pct=finite(31),
+                target_flow_slm=finite(32), target_peak_slm=finite(33), phase=phase, preset=preset,
+                clamped=flag(36), run_id=rid,
+                **{key: uint32(p[i]) if protocol == 2 else None for key, i in
+                   zip(('scan_id', 'row_us', 'cycle_id', 'scan_start_us', 'missed_slots_total', 'tx_dropped_total'), range(38, 44))})
+
+
+def encode_cell(value):
+    if isinstance(value, (list, tuple)):
+        return json.dumps(value, separators=(',', ':'), allow_nan=True)
+    if value is None:
+        return ''
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, float):
+        return format(value, '.12g')
+    return value
+
+
+def sample_record(sample, line):
+    return dict(wire_line=line, **{key: encode_cell(value) for key, value in sample._asdict().items()})
+
+
+def event_record(event):
+    result = {key: encode_cell(value) for key, value in event.items() if key != 'sample'}
+    result.update(seq=event['sample'].seq, cycle_id=event['sample'].cycle_id, phase=event['sample'].phase)
+    return result
+
+
+def open_unique_session(directory, base):
+    """Reserve all three related paths; clean up only paths this attempt owns."""
+    os.makedirs(directory, exist_ok=True)
+    for index in range(10000):
+        name = base + (f'_{index:02d}' if index else '')
+        paths = [os.path.join(directory, name + suffix) for suffix in ('.csv', '_peaks.csv', '_session.json')]
+        files = []
+        try:
+            for path in paths:
+                files.append(open(path, 'x', newline=''))
+            return paths, files
+        except Exception as exc:
+            for path, stream in zip(paths, files):
+                stream.close()
+                os.unlink(path)
+            if not isinstance(exc, FileExistsError):
+                raise
+    raise OSError('could not allocate unique recording names')
+
+
 class SerialLink:
     """Owns the serial connection.
 
@@ -262,8 +312,10 @@ class SerialLink:
 
     def __init__(self, port, baud, avg_window, buffer_seconds=180.0,
                  sample_hz=100.0, peak_config=None,
-                 run_seconds=DEFAULT_RUN_SECONDS):
-        self.ser = serial.Serial(port, baud, timeout=0.2, write_timeout=1.0)
+                 run_seconds=DEFAULT_RUN_SECONDS, gas_temperature_c=None,
+                 absolute_pressure_mbar=None, expected_expiration_sign=None,
+                 serial_instance=None, start_reader=True):
+        self.ser = serial_instance if serial_instance is not None else serial.Serial(port, baud, timeout=0.2, write_timeout=1.0)
         self._serial_write_lock = threading.Lock()
         self._heartbeat_interval = 0.5
         self._last_heartbeat = 0.0
@@ -271,8 +323,7 @@ class SerialLink:
         self.connected = True
         self._ready_event = threading.Event()
         self.avg_window = max(1, avg_window)
-        self.peak_config = peak_config or PeakDetectionConfig(
-            smooth_window=self.avg_window)
+        self.peak_config = peak_config or PeakDetectionConfig()
         self._flow_hist = deque(maxlen=self.avg_window)
         self._flow_sum = 0.0  # running sum: O(1) average instead of O(w)
 
@@ -337,43 +388,76 @@ class SerialLink:
         self._run_start_monotonic = None
         self._run_generation = 0
 
-        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._thread.start()
+        standard_flow(1.0, gas_temperature_c, absolute_pressure_mbar)
+        self.gas_temperature_c = gas_temperature_c
+        self.absolute_pressure_mbar = absolute_pressure_mbar
+        self.expected_expiration_sign = expected_expiration_sign
+        self.state = 'IDLE'
+        self.run_id = None
+        self.mode = None
+        self.protocol_version = None
+        self.metadata = None
+        self._meta_pending = None
+        self._meta_build = None
+        self._meta_invalid = False
+        self._heartbeat_enabled = False
+        self._started_event = threading.Event()
+        self._ended_event = threading.Event()
+        self._rx = bytearray()
+        self._rx_discard = False
+        self._manifest_path = None
+        self.manifest = None
+        self.orientation_mismatches = 0
+        self._reset_analysis_state()
 
-    # ---------------------------------------------------------------- I/O
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        if start_reader:
+            self._thread.start()
+
+    def _write_bytes_locked(self, data):
+        """Caller holds the write lock; a complete write is not an ACK."""
+        try:
+            if self.ser.write(data) != len(data):
+                raise OSError('short serial write')
+            return True
+        except (serial.SerialException, OSError) as exc:
+            self._heartbeat_enabled = False
+            self.connection_error = str(exc)
+            self.connected = False
+            if not self._stop.is_set():
+                print(f'-> transport fault: {exc}; stop unconfirmed')
+            return False
 
     def send_command(self, ch):
         if ch not in COMMANDS:
             return False
-        try:
-            with self._serial_write_lock:
-                self.ser.write(ch.encode("ascii"))
-                self.ser.flush()
-        except (serial.SerialException, OSError) as e:
-            print(f"-> serial write failed: {e}")
-            self.connection_error = str(e)
-            self.connected = False
-            return False
-        return True
+        if ch in PRESET_KEYS:
+            return self.begin_timed_run(int(ch)-1, ch)
+        if ch in MOTION_OVERRIDE_KEYS:
+            if self.run_in_progress() and not self.stop_run():
+                return False
+            return self.begin_timed_run(-2, ch)
+        if ch in SAFETY_OVERRIDE_KEYS and self.run_in_progress():
+            if not self.stop_run():
+                return False
+        with self._serial_write_lock:
+            return self._write_bytes_locked(ch.encode('ascii'))
 
     def _send_heartbeat(self):
-        now = time.monotonic()
-        if now - self._last_heartbeat < self._heartbeat_interval:
-            return True
-        try:
-            with self._serial_write_lock:
-                self.ser.write(b"!")
-            self._last_heartbeat = now
-            return True
-        except (serial.SerialException, OSError) as e:
-            self.connection_error = str(e)
-            self.connected = False
-            print(f"-> serial heartbeat failed; acquisition stopped: {e}")
-            return False
+        with self._serial_write_lock:
+            now = time.monotonic()
+            if not self._heartbeat_enabled or now-self._last_heartbeat < self._heartbeat_interval:
+                return True
+            ok = self._write_bytes_locked(f'@PING,{self.run_id}\n'.encode('ascii'))
+            if ok:
+                self._last_heartbeat = now
+            return ok
 
     def wait_until_ready(self, timeout):
-        """Ask the firmware to acknowledge that setup() has reached loop()."""
-        if not self.send_command("?"):
+        self._ready_event.clear()
+        self.protocol_version = None
+        self.metadata = None
+        if not self.send_command('?'):
             return False
         return self._ready_event.wait(timeout)
 
@@ -381,441 +465,428 @@ class SerialLink:
         try:
             while not self._stop.is_set():
                 if not self._send_heartbeat():
-                    break
+                    self._fault('transport_fault')
+                    return
                 try:
-                    raw = self.ser.readline()
-                except (serial.SerialException, OSError) as e:
-                    self.connection_error = str(e)
-                    self.connected = False
-                    print(f"-> serial connection lost; acquisition stopped: {e}")
-                    break
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                if line.startswith("DATA,"):
-                    self._handle_data_line(line)
-                else:
-                    # Sketch's "# ..." startup banner / human Monitor block —
-                    # not plotted, just echoed so it's visible in the terminal.
-                    if line == "# READY_QUERY":
-                        self._ready_event.set()
-                    print(line)
+                    raw = self.ser.read(256)
+                except (serial.SerialException, OSError) as exc:
+                    if not self._stop.is_set():
+                        self._fault('transport_fault', exc)
+                    return
+                if raw:
+                    self.feed_bytes(raw)
+        except Exception as exc:
+            # Unexpected analysis/format failures must retain a traceback and
+            # disable host ownership; never silently kill only the reader.
+            if not self._stop.is_set():
+                traceback.print_exc()
+                self._fault('analysis_fault', exc)
         finally:
             self.connected = False
-            if not self._stop.is_set():
+
+    def feed_bytes(self, raw):
+        """Incremental bounded framing; timeout never turns fragments into rows."""
+        for byte in raw:
+            if byte == 10:
+                if not self._rx_discard and self._rx:
+                    try:
+                        line = self._rx.decode('ascii').rstrip('\r')
+                    except UnicodeDecodeError:
+                        self._count_bad_line()
+                    else:
+                        self._handle_line(line)
+                self._rx.clear()
+                self._rx_discard = False
+            elif not self._rx_discard:
+                if len(self._rx) >= 1024:
+                    self._rx.clear()
+                    self._rx_discard = True
+                    self._count_bad_line()
+                else:
+                    self._rx.append(byte)
+
+    def _handle_line(self, line):
+        if line.startswith('DATA'):
+            self._handle_data_line(line)
+        elif line.startswith('# '):
+            self._handle_marker(line)
+
+    def _handle_marker(self, line):
+        parts = line[2:].split(',')
+        kind = parts[0]
+        if kind == 'BOOT':
+            if self.run_in_progress():
+                self._fault('board_reset')
+            self.protocol_version = None
+            self.metadata = None
+            self._ready_event.clear()
+        elif parts == ['PROTOCOL', '2']:
+            if self.run_in_progress():
+                self._fault('unexpected_handshake')
+            self.protocol_version = 2
+        elif kind == 'META_BEGIN' and len(parts) == 3 and parts[1] == '2':
+            self._meta_build = parts[2]
+            self._meta_pending = {}
+            self._meta_invalid = False
+        elif kind == 'META' and len(parts) == 4 and parts[1] == '2':
+            if self._meta_pending is None or parts[2] in self._meta_pending:
+                self._meta_invalid = True
+            elif not all(re.fullmatch(r'[A-Za-z0-9_.+\-]+', x) for x in parts[2:]):
+                self._meta_invalid = True
+            else:
+                self._meta_pending[parts[2]] = parts[3]
+        elif kind == 'META_END' and len(parts) == 3:
+            if (parts[1] == '2' and parts[2] == self._meta_build and
+                    not self._meta_invalid and self._meta_pending is not None and
+                    set(self._meta_pending) == META_KEYS):
+                self.metadata = dict(self._meta_pending, build_id=self._meta_build)
+            else:
+                self.metadata = None
+            self._meta_pending = None
+        elif parts == ['READY_QUERY']:
+            # Legacy is display-only. Timed acquisition checks v2 + metadata.
+            if self.protocol_version is None or self.metadata is not None:
+                self._ready_event.set()
                 with self._run_lock:
-                    self._cancel_run_timer_locked()
-                    if self._record_file is not None:
-                        self.stop_recording()
+                    if self.state == 'FAULTED' and self.metadata is not None:
+                        self.state = 'IDLE'
+        elif kind == 'STARTED' and len(parts) == 6 and parts[1] == '2':
+            try:
+                start_ms, start_us = uint32(parts[4]), uint32(parts[5])
+            except ValueError:
+                self._fault('invalid_start_ack')
+                return
+            with self._run_lock:
+                if self.state != 'STARTING' or parts[2] != self.run_id or parts[3] != self.mode:
+                    return
+                with self._record_lock:
+                    self._reset_analysis_state(start_ms, start_us)
+                    self._record_started = True
+                    if self.manifest is not None:
+                        self.manifest['start_ack'] = {'millis': start_ms, 'micros': start_us}
+                        self._save_manifest()
+                self.state = 'RUNNING'
+                self._run_start_monotonic = time.monotonic()
+                timer = threading.Timer(self.run_seconds, self._on_run_timeout, args=(self._run_generation,))
+                timer.daemon = True
+                self._run_timer = timer
+                timer.start()
+                self._started_event.set()
+        elif kind == 'ENDED' and len(parts) == 6 and parts[1] == '2':
+            try:
+                final_seq = -1 if parts[3] == '-1' else uint32(parts[3])
+                dropped = uint32(parts[5])
+                if parts[4] not in ('host_stop', 'watchdog', 'manual_override', 'transport_fault'):
+                    raise ValueError('unknown termination reason')
+            except ValueError:
+                self._fault('invalid_end_ack')
+                return
+            with self._run_lock:
+                if self.state not in ('RUNNING', 'STOPPING', 'STARTING') or parts[2] != self.run_id:
+                    return
+                with self._serial_write_lock:
+                    self._heartbeat_enabled = False
+                self._cancel_run_timer_locked()
+                with self._record_lock:
+                    incomplete = (final_seq != (self._last_seq if self._last_seq is not None else -1) or
+                                  self._run_dropped_rows > 0 or self._run_bad_lines > 0 or dropped > 0)
+                    if self.manifest is not None:
+                        self.manifest['end_ack'] = dict(final_enqueued_seq=final_seq, reason=parts[4], tx_dropped_total=dropped)
+                    self._finalize_locked(parts[4], incomplete)
+                self.state = 'IDLE'
+                self._ended_event.set()
+                if parts[4] in ('host_stop', 'watchdog', 'transport_fault'):
+                    print('-> firmware hold confirmed; recording finalized')
+                else:
+                    print('-> firmware session ended by manual override; recording finalized')
+
+    def _reset_analysis_state(self, start_ms=0, start_us=0):
+        self._flow_hist.clear()
+        self._flow_sum = 0.0
+        self._last_seq = None
+        self._last_sample = None
+        self._clock = MillisUnwrapper()
+        self._clock.update(start_ms)
+        self._last_row_us = start_us
+        self._elapsed_row_us = 0
+        self._segment_id = 0
+
+    def _break_locked(self, reason, before_seq=None):
+        self._flow_hist.clear()
+        self._flow_sum = 0.0
+        self._segment_id += 1
+        if self._detector is not None:
+            self._detector.break_continuity(reason)
+        if self.manifest is not None:
+            self.manifest['boundaries'].append(dict(after_seq=self._last_seq, before_seq=before_seq, reason=reason))
 
     def _handle_data_line(self, line):
-        # MechLung.ino's DATA line — 37 comma-separated fields:
-        #   DATA,seq,millis,flow_slm,flow_ok,
-        #        flow_age_us,Psens1_pa..Psens7_pa,psens_temp_c_avg,
-        #        Psens1_ok..Psens7_ok,Psens1_age_us..Psens7_age_us,
-        #        cmd_dac,feedback_dac,cmd_pct,fdbk_pct,
-        #        target_flow_slm,target_peak_slm,phase,preset,clamped
-        parts = line.split(",")
-        if len(parts) != DATA_FIELDS:
-            self._count_bad_line()
-            return
         try:
-            seq = int(parts[1])
-            ms = int(parts[2])
-            flow_slm = float(parts[3])
-            flow_ok = bool(int(parts[4]))
-            flow_age_us = int(parts[5])
-            pa = [float(parts[6 + i]) for i in range(NUM_PSENS)]
-            temp = float(parts[13])
-            pok = [bool(int(parts[14 + i])) for i in range(NUM_PSENS)]
-            pa_age_us = [int(parts[21 + i]) for i in range(NUM_PSENS)]
-            cmd_dac = int(parts[28])
-            feedback_dac = float(parts[29])
-            cmd_pct = float(parts[30])
-            fdbk_pct = float(parts[31])
-            target_flow_slm = float(parts[32])
-            target_peak_slm = float(parts[33])
-            phase = int(parts[34])
-            preset = int(parts[35])
-            clamped = bool(int(parts[36]))
-        except (ValueError, IndexError):
+            wire = parse_wire(line)
+        except ValueError:
             self._count_bad_line()
             return
-
-        t_s, board_reset = self._clock.update(ms)
-        if board_reset:
-            self._flow_hist.clear()
-            self._flow_sum = 0.0
-            print("-> board millis counter moved backward; starting a new time segment")
-
-        seq_gap = 0
-        if self._last_seq is not None and seq > self._last_seq + 1:
-            seq_gap = seq - self._last_seq - 1
-            self.dropped_rows += seq_gap
-        self._last_seq = seq
-
-        # Streaming moving average, maintained with a running sum so the
-        # cost per sample is constant rather than proportional to --avg.
-        if flow_ok:
-            if len(self._flow_hist) == self._flow_hist.maxlen:
-                self._flow_sum -= self._flow_hist[0]
-            self._flow_hist.append(flow_slm)
-            self._flow_sum += flow_slm
-        else:
-            # Never blend measurements from opposite sides of a data gap.
-            self._flow_hist.clear()
-            self._flow_sum = 0.0
-        flow_avg = (self._flow_sum / len(self._flow_hist)
-                    if self._flow_hist else 0.0)
-
-        sample = Sample(seq, ms, t_s, time.time(), flow_slm, flow_avg,
-                        flow_ok, flow_age_us, pa, temp, pok, pa_age_us,
-                        cmd_dac, feedback_dac, cmd_pct, fdbk_pct,
-                        target_flow_slm, target_peak_slm, phase,
-                        preset, clamped)
-
-        with self.lock:
-            self.t.append(t_s)
-            self.flow_raw.append(flow_slm)
-            self.flow_avg.append(flow_avg)
-            self.flow_ok.append(flow_ok)
-            self.flow_age_us.append(flow_age_us)
-            for i in range(NUM_PSENS):
-                self.psens_pa[i].append(pa[i])
-                self.psens_ok[i].append(pok[i])
-                self.psens_age_us[i].append(pa_age_us[i])
-            self.psens_temp_avg.append(temp)
-            self.cmd_dac.append(cmd_dac)
-            self.feedback_dac.append(feedback_dac)
-            self.cmd_pct.append(cmd_pct)
-            self.fdbk_pct.append(fdbk_pct)
-            self.target_flow_slm.append(target_flow_slm)
-            self.target_peak_slm.append(target_peak_slm)
-            self.phase.append(phase)
-            self.preset.append(preset)
-            self.clamped.append(clamped)
-
-        self._last_preset = preset
-
+        fault = None
         with self._record_lock:
-            if self._record_writer is None:
+            active = self._record_started and self.state in ('RUNNING', 'STOPPING')
+            if self.state == 'STARTING':
                 return
-            if not self._record_sample_allowed_locked(preset):
-                return
-            self._run_dropped_rows += seq_gap
-            if self._run_first_t_s is None:
-                self._run_first_t_s = t_s
-            self._run_last_t_s = t_s
-            try:
-                self._record_writer.writerow(
-                    [f"{sample.host_unix:.3f}", seq, ms, f"{t_s:.4f}",
-                     f"{flow_slm:.4f}", int(flow_ok), flow_age_us]
-                    + [f"{v:.4f}" for v in pa]
-                    + [f"{temp:.2f}"]
-                    + [int(v) for v in pok]
-                    + pa_age_us
-                    + [cmd_dac, f"{feedback_dac:.2f}",
-                       f"{cmd_pct:.2f}", f"{fdbk_pct:.2f}",
-                       f"{target_flow_slm:.3f}", f"{target_peak_slm:.3f}",
-                       phase, preset,
-                       int(clamped)]
-                )
-                self._rows_written += 1
-                # Flush periodically so an unplanned exit (unplugged board,
-                # closed window, power cut mid-run) costs at most one second
-                # of data rather than the whole OS buffer.
-                if self._rows_written % 100 == 0:
-                    self._record_file.flush()
-                if self._detector is not None:
-                    self._detector.push(sample)
-            except (OSError, ValueError) as e:
-                self._abort_recording_locked(e)
+            if active and (wire['run_id'] != self.run_id or wire['preset'] != self._record_expected_preset):
+                fault = 'unexpected_session'
+            elif active and wire['protocol'] != 2:
+                fault = 'legacy_row_in_v2_session'
+            if fault is None:
+                try:
+                    sample = self._sample_from_wire(wire, active)
+                except ValueError:
+                    fault = 'board_time_reset' if active else None
+                    if not active:
+                        self._reset_analysis_state(wire['ms'], wire['row_us'] or 0)
+                    sample = None
+                if sample is not None:
+                    self._plot_sample(sample)
+                    if active and self._record_writer is not None:
+                        try:
+                            self._record_writer.writerow(sample_record(sample, line))
+                            self._rows_written += 1
+                            if self._rows_written % 100 == 0:
+                                self._record_file.flush()
+                                self._save_manifest()
+                        except OSError as exc:
+                            fault = 'storage_fault'
+                            self.connection_error = str(exc)
+                        except Exception:
+                            traceback.print_exc()
+                            fault = 'format_fault'
+                        if fault is None:
+                            try:
+                                self._detector.push(sample)
+                            except OSError as exc:
+                                fault = 'storage_fault'
+                                self.connection_error = str(exc)
+                            except Exception:
+                                traceback.print_exc()
+                                fault = 'analysis_fault'
+                                self._detector = None  # do not retry a broken callback/flush
+        if fault:
+            self._fault(fault)
 
-    # ----------------------------------------------------------- plotting
+    def _sample_from_wire(self, w, active):
+        elapsed_s, reset = self._clock.update(w['ms'])
+        if reset:
+            raise ValueError('millis reset')
+        if w['protocol'] == 2:
+            delta = (w['row_us'] - self._last_row_us) & 0xffffffff
+            if delta > 0x7fffffff:
+                raise ValueError('micros reset')
+            self._elapsed_row_us += delta
+            self._last_row_us = w['row_us']
+            if active and abs(self._elapsed_row_us/1e6-elapsed_s) > .003:
+                raise ValueError('millis/micros disagree')
+            row_time_us = self._elapsed_row_us
+            flow_time_us = row_time_us-w['flow_age_us'] if w['flow_age_us'] >= 0 else row_time_us
+            t_s = flow_time_us/1e6
+        else:
+            row_time_us = int(elapsed_s*1e6)
+            flow_time_us = row_time_us-w['flow_age_us'] if w['flow_age_us'] >= 0 else row_time_us
+            t_s = flow_time_us/1e6
+        previous = self._last_sample
+        reason = None
+        if previous is not None:
+            delta_seq = (w['seq']-previous.seq) & 0xffffffff
+            if delta_seq != 1:
+                reason = 'sequence_discontinuity'
+                if 1 < delta_seq < 0x80000000:
+                    self.dropped_rows += delta_seq-1
+                    if active:
+                        self._run_dropped_rows += delta_seq-1
+            elif w['scan_id'] is not None and previous.scan_id is not None and (w['scan_id']-previous.scan_id) & 0xffffffff != 1:
+                reason = 'scan_discontinuity'
+            elif not 0 < (t_s-previous.t_s)*1e6 <= self.peak_config.max_sample_gap_us:
+                reason = 'flow_time_discontinuity'
+            elif w['missed_slots_total'] != previous.missed_slots_total or w['tx_dropped_total'] != previous.tx_dropped_total:
+                reason = 'firmware_loss'
+        if not w['flow_ok']:
+            reason = 'invalid_flow'
+        if reason:
+            self._break_locked(reason, w['seq'])
+        if w['flow_ok']:
+            if len(self._flow_hist) == self.avg_window:
+                self._flow_sum -= self._flow_hist[0]
+            self._flow_hist.append(w['flow_raw'])
+            self._flow_sum += w['flow_raw']
+        average = self._flow_sum/len(self._flow_hist) if self._flow_hist else 0.0
+        resolved = standard_flow(w['target_peak_slm'], self.gas_temperature_c, self.absolute_pressure_mbar)
+        target = w['target_peak_slm'] if resolved is None else resolved
+        sample = Sample(
+            w['seq'], w['ms'], t_s, time.time(), w['flow_raw'], average,
+            w['flow_ok'], w['flow_age_us'], w['pa'], w['temp'], w['pok'], w['pa_age_us'],
+            w['cmd_dac'], w['feedback_dac'], w['cmd_pct'], w['fdbk_pct'],
+            w['target_flow_slm'], target, w['phase'], w['preset'], w['clamped'],
+            w['run_id'], w['scan_id'], w['row_us'], w['cycle_id'], w['scan_start_us'],
+            w['missed_slots_total'], w['tx_dropped_total'], row_time_us, flow_time_us,
+            [row_time_us-a if a >= 0 else None for a in w['pa_age_us']],
+            self._segment_id, reason or '', resolved is not None,
+            w['target_peak_slm'])
+        self._last_seq = sample.seq
+        self._last_sample = sample
+        self._last_preset = sample.preset
+        return sample
+
+    def _plot_sample(self, sample):
+        with self.lock:
+            self.t.append(sample.t_s)
+            for name in ('flow_raw', 'flow_avg', 'flow_ok', 'flow_age_us', 'cmd_dac',
+                         'feedback_dac', 'cmd_pct', 'fdbk_pct', 'target_flow_slm',
+                         'target_peak_slm', 'phase', 'preset', 'clamped'):
+                value = getattr(sample, name)
+                if name in ('flow_raw', 'flow_avg') and not sample.flow_ok:
+                    value = float('nan')
+                getattr(self, name).append(value)
+            self.psens_temp_avg.append(sample.temp)
+            for ch in range(7):
+                self.psens_pa[ch].append(sample.pa[ch] if sample.pok[ch] else float('nan'))
+                self.psens_ok[ch].append(sample.pok[ch])
+                self.psens_age_us[ch].append(sample.pa_age_us[ch])
 
     def snapshot(self):
-        """Consistent copy of every series, cached for one frame period."""
-        now = time.monotonic()
-        if self._snap_cache is not None and now - self._snap_stamp < self._snap_ttl:
-            return self._snap_cache
         with self.lock:
-            snap = (list(self.t), list(self.flow_raw), list(self.flow_avg),
-                    list(self.flow_ok),
-                    list(self.flow_age_us),
-                    [list(d) for d in self.psens_pa], list(self.psens_temp_avg),
-                    [list(d) for d in self.psens_ok],
-                    [list(d) for d in self.psens_age_us],
-                    list(self.cmd_dac), list(self.feedback_dac),
-                    list(self.cmd_pct), list(self.fdbk_pct),
-                    list(self.target_flow_slm), list(self.target_peak_slm),
-                    list(self.phase),
+            return (list(self.t), list(self.flow_raw), list(self.flow_avg), list(self.flow_ok),
+                    list(self.flow_age_us), [list(x) for x in self.psens_pa], list(self.psens_temp_avg),
+                    [list(x) for x in self.psens_ok], [list(x) for x in self.psens_age_us],
+                    list(self.cmd_dac), list(self.feedback_dac), list(self.cmd_pct), list(self.fdbk_pct),
+                    list(self.target_flow_slm), list(self.target_peak_slm), list(self.phase),
                     list(self.preset), list(self.clamped))
-        self._snap_cache, self._snap_stamp = snap, now
-        return snap
 
-    # ---------------------------------------------------------- recording
+    def _write_peak_row(self, event):
+        self._peak_writer.writerow(event_record(event))
+        self._peak_file.flush()
+        if event['excursion_complete'] and self.expected_expiration_sign is not None:
+            expected = 1 if self.expected_expiration_sign == 'positive' else -1
+            if event['sample'].phase == 1:
+                expected *= -1
+            if event['direction'] != expected:
+                self.orientation_mismatches += 1
+                if self.orientation_mismatches == 1:
+                    print('-> flow sign disagrees with configured phase orientation')
+        result = 'unscored' if event['qualified_peak'] is None else str(event['qualified_peak'])
+        print(f"-> peak {event['peak_idx']}: qualified={result}; reasons={','.join(event['reason_codes'])}")
 
-    def _record_sample_allowed_locked(self, preset):
-        """Reject queued pre-command rows until the requested preset appears.
-
-        Caller holds _record_lock. Files are opened before motion is commanded
-        so the first preset sample cannot be lost; this gate makes that safe
-        when a prior demo/preset row was already queued in the serial reader.
-        A queued row from a previous run of the same preset is indistinguishable
-        here, but the firmware's ordered command stream and idle log gate make
-        that edge case safe in normal operation.
-        """
-        if self._record_started:
-            return True
-        if preset != self._record_expected_preset:
-            return False
-        self._record_started = True
-        return True
-
-    def _write_peak_row(self, ev):
-        s = ev["sample"]
-        row = ([ev["peak_idx"], f"{s.host_unix:.3f}", s.seq, s.ms,
-                f"{s.t_s:.4f}", f"{ev['peak_time_s']:.5f}",
-                f"{ev['peak_offset_samples']:.3f}",
-                PRESET_NAMES.get(s.preset, s.preset),
-                PHASE_NAMES.get(s.phase, s.phase),
-                "positive" if ev["direction"] > 0 else "negative",
-                f"{ev['flow_peak_slm']:.4f}", f"{s.flow_raw:.4f}",
-                int(s.flow_ok), s.flow_age_us,
-                f"{s.target_flow_slm:.4f}", f"{ev['target_peak_slm']:.4f}",
-                f"{ev['target_error_slm']:.4f}",
-                f"{ev['target_error_pct']:.3f}",
-                "" if ev["target_met"] is None else int(ev["target_met"]),
-                int(ev["is_warmup"])]
-               + [f"{v:.4f}" for v in s.pa]
-               + [f"{v:.4f}" for v in ev["pa_mean"]]
-               + [f"{v:.4f}" for v in ev["pa_std"]]
-               + [int(v) for v in s.pok]
-               + list(s.pa_age_us)
-               + [f"{v:.3f}" for v in ev["pa_ok_frac"]]
-               + [int(ev["pressure_all_ok"]), ev["max_pressure_age_us"],
-                  ev["pressure_age_span_us"], ev["flow_pressure_skew_us"],
-                  int(ev["timing_ok"]),
-                  "" if ev["qualified_peak"] is None else
-                  int(ev["qualified_peak"]),
-                  int(ev["excursion_complete"]),
-                  f"{s.temp:.2f}", ev["plateau_n"],
-                  int(ev["plateau_contiguous"]),
-                  f"{ev['plateau_span_s']:.4f}", ev["excursion_n"],
-                  f"{ev['excursion_s']:.3f}",
-                  s.cmd_dac, f"{s.feedback_dac:.2f}",
-                  f"{s.cmd_dac - s.feedback_dac:.2f}",
-                  f"{s.cmd_pct:.2f}", f"{s.fdbk_pct:.2f}", int(s.clamped)])
-        self._peak_writer.writerow(row)
-        self._peak_file.flush()  # one row per breath — always worth flushing
-        target_result = ("PARTIAL" if not ev["excursion_complete"] else
-                         ("N/A" if ev["target_met"] is None else
-                         ("PASS" if ev["target_met"] else "MISS")))
-        capture_result = ("PARTIAL" if ev["qualified_peak"] is None else
-                          ("VALID" if ev["qualified_peak"] else "INVALID"))
-        print(f"-> peak #{ev['peak_idx']:3d} "
-              f"{PHASE_NAMES.get(s.phase, s.phase):>11}  "
-              f"{ev['flow_peak_slm']:7.2f} slm   "
-              f"target {ev['target_peak_slm']:6.2f} ({target_result}; "
-              f"capture {capture_result})   "
-              f"{'[WARMUP] ' if ev['is_warmup'] else ''}"
-              f"P1..P7 (plateau mean, Pa): "
-              + " ".join(f"{v:7.2f}" for v in ev["pa_mean"]))
-
-    def _clear_recording_state_locked(self, keep_paths=False):
-        self._record_file = self._record_writer = None
-        self._peak_file = self._peak_writer = None
-        if not keep_paths:
-            self._record_path = self._peak_path = None
-        self._detector = None
-        self._record_expected_preset = None
-        self._record_started = False
-
-    def _abort_recording_locked(self, error):
-        paths = (self._record_path, self._peak_path)
-        for file_obj in (self._record_file, self._peak_file):
-            if file_obj is not None:
-                try:
-                    file_obj.close()
-                except OSError:
-                    pass
-        # Keep paths until the timed run completes or is aborted. An abort
-        # must still be able to remove partial files after an I/O failure.
-        self._clear_recording_state_locked(keep_paths=True)
-        print(f"-> recording stopped after file I/O error: {error}\n"
-              f"     partial files: {paths[0]}\n     {paths[1]}")
+    def _save_manifest(self):
+        if self.manifest is None or self._manifest_path is None:
+            return
+        temporary = self._manifest_path + '.tmp'
+        created = False
+        try:
+            with open(temporary, 'x') as stream:
+                created = True
+                json.dump(self.manifest, stream, indent=2, allow_nan=False)
+                stream.write('\n')
+            os.replace(temporary, self._manifest_path)
+        finally:
+            if created and os.path.exists(temporary):
+                os.unlink(temporary)
 
     def start_recording(self, preset_index=None):
-        """Begin logging to a per-sample CSV and a per-peak CSV, both named
-        after the current preset, under RECORDINGS_DIR. Returns the pair of
-        paths, or None if a recording is already in progress or a file
-        couldn't be opened (in which case a message explaining why is
-        printed here)."""
         with self._record_lock:
             if self._record_file is not None:
-                print("-> already recording — press 'p' to stop first")
                 return None
-            if self._record_path is not None:
-                print("-> the active run's recording already stopped after "
-                      "an I/O error")
-                return None
-
             preset = self._last_preset if preset_index is None else preset_index
-            # Arm while the writer is still disabled. _handle_data_line()
-            # takes the same lock, so queued rows cannot race this setup.
+            base = f"{PRESET_NAMES.get(preset, 'unknown').replace('/', '-').replace(' ', '_')}_{time.strftime('%Y%m%d_%H%M%S')}"
+            try:
+                paths, files = open_unique_session(RECORDINGS_DIR, base)
+                self._record_path, self._peak_path, self._manifest_path = paths
+                self._record_file, self._peak_file, manifest_file = files
+                manifest_file.close()
+                self._record_writer = csv.DictWriter(self._record_file, fieldnames=SAMPLE_COLUMNS)
+                self._peak_writer = csv.DictWriter(self._peak_file, fieldnames=PEAK_COLUMNS)
+                self._record_writer.writeheader()
+                self._peak_writer.writeheader()
+                self.manifest = dict(
+                    protocol_version=2, sample_schema=2, peak_schema=2, analysis_policy=2,
+                    run_id=self.run_id, mode=self.mode, preset=preset,
+                    detector_config=asdict(self.peak_config), avg_window=self.avg_window,
+                    expected_expiration_sign=self.expected_expiration_sign,
+                    flow_reference=dict(gas_temperature_c=self.gas_temperature_c,
+                                        absolute_pressure_mbar=self.absolute_pressure_mbar),
+                    software_hashes={name: hashlib.sha256(Path(SCRIPT_DIR, name).read_bytes()).hexdigest()
+                                     for name in ('Data_Logger.txt', 'peak_detection.py')},
+                    firmware=self.metadata, time_origin='STARTED read-completion-relative microseconds',
+                    start_ack=None, end_ack=None, boundaries=[], complete=False,
+                    tail_truncated=True, termination_reason='open', rows=0,
+                    missing_rows=0, invalid_rows=0)
+                self._save_manifest()
+            except OSError as exc:
+                for stream in (self._record_file, self._peak_file):
+                    if stream is not None:
+                        stream.close()
+                self._record_file = self._peak_file = None
+                self._record_writer = self._peak_writer = None
+                print(f'-> storage fault allocating recording: {exc}')
+                return None
             self._record_expected_preset = preset
             self._record_started = False
-            preset_name = PRESET_NAMES.get(preset, "unknown")
-            safe_name = preset_name.replace("/", "-").replace(" ", "_")
-            base = f"{safe_name}_{time.strftime('%Y%m%d_%H%M%S')}"
-            try:
-                (data_path, peak_path,
-                 self._record_file, self._peak_file) = open_unique_csv_pair(
-                    RECORDINGS_DIR, base)
-            except OSError as e:
-                print(f"-> couldn't start recording ({e.strerror or e}); "
-                      f"directory: {RECORDINGS_DIR}")
-                for f in (self._record_file, self._peak_file):
-                    if f is not None:
-                        f.close()
-                self._record_file = self._peak_file = None
-                self._record_expected_preset = None
-                return None
-
-            self._record_path, self._peak_path = data_path, peak_path
-            self._record_writer = csv.writer(self._record_file)
-            self._peak_writer = csv.writer(self._peak_file)
-            try:
-                self._record_writer.writerow(
-                    ["host_unix_s", "seq", "millis", "t_s", "flow_slm",
-                     "flow_ok", "flow_age_us"]
-                    + [f"Psens{i + 1}_pa" for i in range(NUM_PSENS)]
-                    + ["psens_temp_c_avg"]
-                    + [f"Psens{i + 1}_ok" for i in range(NUM_PSENS)]
-                    + [f"Psens{i + 1}_age_us" for i in range(NUM_PSENS)]
-                    + ["cmd_dac", "feedback_dac", "cmd_pct", "fdbk_pct",
-                       "target_flow_slm", "target_peak_slm", "phase",
-                       "preset", "clamped"]
-                )
-                self._peak_writer.writerow(
-                    ["peak_idx", "host_unix_s", "seq", "millis",
-                     "nearest_sample_t_s", "interpolated_peak_t_s",
-                     "peak_offset_samples", "preset", "phase", "flow_sign",
-                     "flow_peak_slm", "flow_raw_at_peak_slm", "flow_ok",
-                     "flow_age_us", "target_flow_at_sample_slm",
-                     "target_peak_slm", "target_error_slm",
-                     "target_error_pct", "target_met", "is_warmup"]
-                    + [f"Psens{i + 1}_pa_at_peak" for i in range(NUM_PSENS)]
-                    + [f"Psens{i + 1}_pa_plateau_mean" for i in range(NUM_PSENS)]
-                    + [f"Psens{i + 1}_pa_plateau_std" for i in range(NUM_PSENS)]
-                    + [f"Psens{i + 1}_ok_at_peak" for i in range(NUM_PSENS)]
-                    + [f"Psens{i + 1}_age_us_at_peak" for i in range(NUM_PSENS)]
-                    + [f"Psens{i + 1}_ok_frac_plateau" for i in range(NUM_PSENS)]
-                    + ["all_pressures_ok_at_peak", "max_pressure_age_us",
-                       "pressure_age_span_us", "max_flow_pressure_skew_us",
-                       "sensor_timing_ok", "qualified_peak",
-                       "excursion_complete",
-                       "psens_temp_c_avg", "plateau_n", "plateau_contiguous",
-                       "plateau_span_s", "excursion_n", "excursion_s",
-                       "cmd_dac", "feedback_dac", "tracking_error_dac",
-                       "cmd_pct", "fdbk_pct", "clamped"]
-                )
-            except OSError as e:
-                self._abort_recording_locked(e)
-                return None
-
-            self._detector = PeakFlowDetector(
-                self.peak_config, self._write_peak_row)
-
-            self._rows_written = 0
-            self._run_bad_lines = 0
-            self._run_dropped_rows = 0
-            self._run_first_t_s = None
-            self._run_last_t_s = None
-            print(f"-> recording started:\n     samples: {data_path}\n"
-                  f"     peaks  : {peak_path}")
-            return data_path, peak_path
-
-    def stop_recording(self):
-        """Close the current recording, if any. Returns the pair of paths,
-        or None if nothing was being recorded."""
-        with self._record_lock:
-            if self._record_file is None:
-                if self._record_path is not None:
-                    paths = (self._record_path, self._peak_path)
-                    self._clear_recording_state_locked()
-                    print("-> timed run ended; partial files from the earlier "
-                          f"I/O failure were kept:\n     {paths[0]}\n"
-                          f"     {paths[1]}")
-                    return paths
-                print("-> not currently recording")
-                return None
-            paths = (self._record_path, self._peak_path)
-            try:
-                if self._detector is not None:
-                    self._detector.flush()  # emit a breath still in progress
-                    n_peaks = self._detector.count
-                    n_short = self._detector.discarded
-                    n_target_pass = self._detector.target_passes
-                    n_target_miss = self._detector.target_misses
-                    n_partial = self._detector.partial_excursions
-                    n_pressure_incomplete = self._detector.pressure_incomplete
-                    n_timing_fail = self._detector.timing_failures
-                    n_qualified = self._detector.qualified_peaks
-                    n_unqualified = self._detector.unqualified_peaks
-                else:
-                    n_peaks = n_short = n_target_pass = n_target_miss = 0
-                    n_partial = 0
-                    n_pressure_incomplete = n_timing_fail = 0
-                    n_qualified = n_unqualified = 0
-            except (OSError, ValueError) as e:
-                self._abort_recording_locked(e)
-                # stop_recording() is itself a run-ending path, so there is
-                # no later abort that needs the remembered filenames.
-                self._clear_recording_state_locked()
-                return paths
-            for f in (self._record_file, self._peak_file):
-                try:
-                    f.close()
-                except OSError as e:
-                    print(f"-> warning: error closing recording file: {e}")
-            self._clear_recording_state_locked()
-            elapsed_s = ((self._run_last_t_s - self._run_first_t_s)
-                         if self._run_first_t_s is not None and
-                         self._run_last_t_s is not None else 0.0)
-            effective_hz = ((self._rows_written - 1) / elapsed_s
-                            if self._rows_written > 1 and elapsed_s > 0.0
-                            else 0.0)
-            print(f"-> recording stopped: {self._rows_written} samples, "
-                  f"{n_peaks} peaks"
-                  + (f" ({n_short} excursions too short, discarded)" if n_short else "")
-                  + (f", {self._run_bad_lines} malformed rows skipped"
-                     if self._run_bad_lines else "")
-                  + f", target {n_target_pass} pass/{n_target_miss} miss"
-                  + f", combined flow+pressure {n_qualified} valid/"
-                    f"{n_unqualified} invalid"
-                  + f", {n_partial} partial excursions excluded from target scoring"
-                  + f", pressure incomplete at {n_pressure_incomplete} peaks"
-                  + f", sensor timing failed at {n_timing_fail} peaks"
-                  + f", effective {effective_hz:.2f} Hz"
-                  + f", {self._run_dropped_rows} sequence rows missing"
-                  + f"\n     {paths[0]}\n     {paths[1]}")
+            self._rows_written = self._run_bad_lines = self._run_dropped_rows = 0
+            self.orientation_mismatches = 0
+            self._detector = PeakFlowDetector(self.peak_config, self._write_peak_row)
             return paths
+
+    def _finalize_locked(self, reason, tail_truncated):
+        if self._record_file is None:
+            return
+        failed = False
+        counters = {}
+        try:
+            if self._detector is not None:
+                self._detector.flush()
+                counters = {name: getattr(self._detector, name) for name in (
+                    'count', 'discarded', 'target_passes', 'target_misses', 'partial_excursions',
+                    'warmup_peaks', 'reference_unresolved', 'pressure_incomplete', 'timing_failures',
+                    'qualified_peaks', 'unqualified_peaks')}
+        except OSError as exc:
+            failed = True
+            reason = 'storage_fault'
+            print(f'-> storage fault finalizing recording: {exc}')
+        except Exception:
+            failed = True
+            reason = 'analysis_fault'
+            traceback.print_exc()
+        # The final manifest is published only after both streams flush/close.
+        for stream in (self._record_file, self._peak_file):
+            try:
+                stream.flush()
+                stream.close()
+            except OSError as exc:
+                failed = True
+                reason = 'storage_fault'
+                print(f'-> storage fault closing recording: {exc}')
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        self.manifest.update(complete=not (tail_truncated or failed),
+                             tail_truncated=tail_truncated or failed, termination_reason=reason,
+                             rows=self._rows_written, missing_rows=self._run_dropped_rows,
+                             invalid_rows=self._run_bad_lines, orientation_mismatches=self.orientation_mismatches,
+                             populations=counters)
+        try:
+            self._save_manifest()
+        except OSError as exc:
+            print(f'-> storage fault publishing manifest: {exc}; original remains incomplete')
+        self._record_file = self._peak_file = None
+        self._record_writer = self._peak_writer = None
+        self._record_started = False
+        self._detector = None
+        print(f'-> recording populations (main totals exclude warmup/partial/unresolved): {counters}')
 
     def _count_bad_line(self):
         self.bad_lines += 1
         with self._record_lock:
-            if self._record_file is not None:
+            if self._record_started:
                 self._run_bad_lines += 1
+                self._break_locked('malformed_data')
 
     def _cancel_run_timer_locked(self):
-        """Cancel the current timer and invalidate any callback already queued.
-
-        Caller must hold _run_lock. Timer.cancel() cannot prevent a callback
-        that has already begun, so the generation increment is authoritative.
-        """
         self._run_generation += 1
         if self._run_timer is not None:
             self._run_timer.cancel()
@@ -823,120 +894,125 @@ class SerialLink:
         self._run_start_monotonic = None
 
     def begin_timed_run(self, preset_index, command):
-        """Open recording, command the preset, then arm its safety timer."""
         with self._run_lock:
-            if self._run_timer is not None:
+            if self.state != 'IDLE' or self.protocol_version != 2 or self.metadata is None:
+                print('-> timed runs require idle state and a complete protocol-2 handshake')
                 return False
-            self._last_seq = None
-            paths = self.start_recording(preset_index)
-            if not self.send_command(command):
-                if paths is not None:
-                    self._discard_recording()
-                return False
+            self.run_id = secrets.token_hex(8)
+            self.mode = 'DEMO' if preset_index == -2 else f'P{preset_index}'
             self._run_generation += 1
-            generation = self._run_generation
-            self._run_start_monotonic = time.monotonic()
-            timer = threading.Timer(self.run_seconds, self._on_run_timeout,
-                                    args=(generation,))
-            timer.daemon = True
-            self._run_timer = timer
-            timer.start()
-            if paths is None:
-                print("-> timed motion armed, but CSV recording could not start")
-            else:
-                print(f"-> timed run armed for {self.run_seconds:g} seconds")
-            return True
+            self.state = 'STARTING'
+            self._started_event = threading.Event()
+            self._ended_event = threading.Event()
+            started_event = self._started_event
+            owned_id = self.run_id
+            deadline = time.monotonic() + 2.0
+            if self.start_recording(preset_index) is None:
+                self.state = 'IDLE'
+                return False
+            with self._serial_write_lock:
+                self._heartbeat_enabled = True
+                self.ser.write_timeout = max(.001, deadline-time.monotonic())
+                sent = self._write_bytes_locked(f'@START,{self.run_id},{self.mode}\n'.encode('ascii'))
+        # Reader takes both locks for ACK; no lifecycle/record lock while waiting.
+        if not sent or not started_event.wait(max(0, deadline-time.monotonic())):
+            self._fault('start_unconfirmed', expected_run_id=owned_id)
+            return False
+        return True
 
     def _on_run_timeout(self, generation):
+        self.stop_run(generation=generation)
+
+    def stop_run(self, generation=None, discard=False):
         with self._run_lock:
-            if (generation != self._run_generation or
-                    self._run_timer is None):
+            if generation is not None and generation != self._run_generation:
+                return False
+            if self.state not in ('STARTING', 'RUNNING', 'STOPPING'):
+                return False
+            owner = self.state != 'STOPPING'
+            owned_id = self.run_id
+            ended_event = self._ended_event
+            paths = (self._record_path, self._peak_path, self._manifest_path)
+            if owner:
+                self.state = 'STOPPING'
+                self._cancel_run_timer_locked()
+                self._stop_deadline = time.monotonic()+2.0
+            deadline = self._stop_deadline
+            with self._serial_write_lock:
+                self._heartbeat_enabled = False
+                if owner:
+                    self.ser.write_timeout = max(.001, deadline-time.monotonic())
+                    sent = self._write_bytes_locked(f'@STOP,{owned_id}\n'.encode('ascii'))
+                else:
+                    sent = True
+        confirmed = sent and ended_event.wait(min(1.0, max(0, deadline-time.monotonic())))
+        if not confirmed and owner and sent:
+            with self._run_lock:
+                if self.run_id == owned_id and self.state == 'STOPPING' and time.monotonic() < deadline:
+                    with self._serial_write_lock:
+                        self.ser.write_timeout = max(.001, deadline-time.monotonic())
+                        sent = self._write_bytes_locked(f'@STOP,{owned_id}\n'.encode('ascii'))
+            confirmed = sent and ended_event.wait(max(0, deadline-time.monotonic()))
+        elif not confirmed and sent:
+            confirmed = ended_event.wait(max(0, deadline-time.monotonic()))
+        if not confirmed:
+            self._fault('stop_unconfirmed', expected_run_id=owned_id)
+        if discard:
+            self._discard_paths(paths)
+        return confirmed
+
+    def _fault(self, reason, exc=None, expected_run_id=None):
+        with self._run_lock:
+            if expected_run_id is not None and (self.run_id != expected_run_id or self.state == 'IDLE'):
                 return
-            self._run_timer = None
-            self._run_start_monotonic = None
-            self._run_generation += 1
-            if self.connected:
-                self.send_command("H")
-            self.stop_recording()
-            print("-> timed run complete; actuator returned to hold")
+            with self._serial_write_lock:
+                self._heartbeat_enabled = False
+            self._cancel_run_timer_locked()
+            self.state = 'FAULTED'
+            self._ready_event.clear()
+            with self._record_lock:
+                self._finalize_locked(reason, True)
+        print(f'-> {reason}: {exc or "stop unconfirmed; heartbeat disabled"}')
 
     def run_in_progress(self):
         with self._run_lock:
-            return self._run_timer is not None
+            return self.state in ('STARTING', 'RUNNING', 'STOPPING')
 
     def run_remaining(self):
         with self._run_lock:
             if self._run_start_monotonic is None:
                 return None
-            return max(0.0, self.run_seconds -
-                       (time.monotonic() - self._run_start_monotonic))
+            return max(0.0, self.run_seconds-(time.monotonic()-self._run_start_monotonic))
 
     def end_run_override(self):
-        """Keep partial CSVs when a manual mode switch ends a run early."""
-        with self._run_lock:
-            if self._run_timer is None:
-                return False
-            self._cancel_run_timer_locked()
-            self.stop_recording()
-            print("-> timed run ended early; partial recording kept")
-            return True
+        return self.stop_run()
 
     def abort_run(self):
-        """Discard partial files and return the actuator to hold."""
-        with self._run_lock:
-            if self._run_timer is None:
-                print("-> no timed run is active")
-                return False
-            self._cancel_run_timer_locked()
-            if self.connected:
-                self.send_command("H")
-            self._discard_recording()
-            print("-> timed run aborted; partial recording discarded")
-            return True
+        return self.stop_run(discard=True)
 
-    def _discard_recording(self):
-        with self._record_lock:
-            paths = (self._record_path, self._peak_path)
-            for file_obj in (self._record_file, self._peak_file):
-                if file_obj is not None:
-                    try:
-                        file_obj.close()
-                    except OSError:
-                        pass
-            self._clear_recording_state_locked()
-            for path in paths:
-                if path is not None:
-                    try:
-                        os.remove(path)
-                    except FileNotFoundError:
-                        pass
-                    except OSError as e:
-                        print(f"-> warning: could not remove partial file "
-                              f"{path}: {e}")
+    def stop_recording(self):
+        return self.stop_run()
+
+    @staticmethod
+    def _discard_paths(paths):
+        for path in paths:
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    print(f'-> could not remove recording: {exc}')
 
     def close(self):
-        # A normal logger shutdown should hold immediately; the firmware
-        # heartbeat watchdog covers crashes and cable loss.
+        if self.run_in_progress():
+            self.stop_run()
         self._stop.set()
-        with self._run_lock:
-            self._cancel_run_timer_locked()
-            if self.connected:
-                self.send_command("H")
-            if self._record_file is not None:
-                self.stop_recording()
-        try:
+        with self._serial_write_lock:
+            self._heartbeat_enabled = False
             self.ser.close()
-        except Exception:
-            pass
-        self._thread.join(timeout=2.0)
-        if self.bad_lines:
-            print(f"-> note: {self.bad_lines} malformed/partial DATA lines "
-                  f"were skipped (normal for the first line or two after "
-                  f"connecting)")
-        if self.dropped_rows:
-            print(f"-> note: {self.dropped_rows} DATA sequence rows were "
-                  f"missing from the serial stream")
-
+        if self._thread.ident is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
 
 def visible_start(t, window_s):
     """Index of the first sample within `window_s` seconds of the latest one.
@@ -953,6 +1029,7 @@ def visible_start(t, window_s):
 def autoscale(ax, values, min_span=1.0, pad_frac=0.15):
     """Pad around the visible min/max, never collapsing to a zero-height
     window when the signal is flat."""
+    values = [v for v in values if math.isfinite(v)]
     if not values:
         return
     lo, hi = min(values), max(values)
@@ -1019,10 +1096,10 @@ def main():
     ap.add_argument("--window", type=positive_float, default=20.0, help="Seconds of history shown on screen.")
     ap.add_argument("--avg", type=positive_int, default=9,
                     help="Trailing moving-average window for the live flow "
-                         "display (samples; default: 9).")
-    ap.add_argument("--peak-smooth", type=positive_int, default=None,
+                         "display and segmentation (samples; default: 9).")
+    ap.add_argument("--peak-smooth", type=positive_int, default=9,
                     help="Centred moving-average window used for offline peak "
-                         "location. Defaults to --avg when omitted.")
+                         "location. Independent default: 9; must be odd.")
     ap.add_argument("--buffer", type=positive_float, default=180.0,
                     help="Seconds of history retained in memory.")
     ap.add_argument("--peak-threshold-frac", type=unit_fraction,
@@ -1036,7 +1113,7 @@ def main():
     ap.add_argument("--peak-exit", type=unit_fraction, default=0.5,
                     help="Excursion closes when |flow| drops below this fraction "
                          "of its latched adaptive threshold.")
-    ap.add_argument("--peak-min-samples", type=positive_int, default=5,
+    ap.add_argument("--peak-min-samples", type=positive_int, default=9,
                     help="Excursions shorter than this are discarded as noise.")
     ap.add_argument("--peak-plateau", type=unit_fraction, default=0.99,
                     help="Plateau = samples within this fraction of the peak; the "
@@ -1060,7 +1137,15 @@ def main():
                     help="Duration of each preset's automatic recording before "
                          "the actuator returns to hold (default: 180).")
     ap.add_argument("--list-ports", action="store_true", help="List serial ports and exit.")
+    ap.add_argument('--gas-temperature-c', type=float)
+    ap.add_argument('--absolute-pressure-mbar', type=float)
+    ap.add_argument('--expected-expiration-sign', choices=('positive', 'negative'))
+    ap.add_argument('--max-sample-gap-us', type=positive_float, default=15000)
     args = ap.parse_args()
+    try:
+        standard_flow(1.0, args.gas_temperature_c, args.absolute_pressure_mbar)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     if args.list_ports:
         list_ports()
@@ -1072,10 +1157,11 @@ def main():
         exit_frac=args.peak_exit,
         min_samples=args.peak_min_samples,
         plateau_frac=args.peak_plateau,
-        smooth_window=args.peak_smooth or args.avg,
+        smooth_window=args.peak_smooth,
         target_tolerance_frac=args.peak_tolerance_pct / 100.0,
         max_sensor_age_us=args.max_sensor_age_ms * 1000.0,
         warmup_breaths=args.warmup_breaths,
+        max_sample_gap_us=args.max_sample_gap_us,
     )
     port = args.port or pick_port()
     print(f"Connecting to {port} @ {args.baud}...")
@@ -1083,13 +1169,16 @@ def main():
         link = SerialLink(port, args.baud, args.avg,
                           buffer_seconds=args.buffer,
                           peak_config=peak_config,
-                          run_seconds=args.run_seconds)
+                          run_seconds=args.run_seconds,
+                          gas_temperature_c=args.gas_temperature_c,
+                          absolute_pressure_mbar=args.absolute_pressure_mbar,
+                          expected_expiration_sign=args.expected_expiration_sign)
     except (serial.SerialException, OSError) as e:
         sys.exit(f"Couldn't open {port}: {e}\n"
                  f"Close the Arduino Serial Monitor (only one program can hold "
                  f"the port) and check the board is plugged in.")
 
-    # Opening the port resets most Arduino boards. Wait through the normal
+    # Native USB port opening may not reset the board. Wait through normal
     # centre-hold, then require an acknowledgement emitted only from loop().
     time.sleep(2.5)
     if not link.wait_until_ready(5.0):
@@ -1118,19 +1207,8 @@ def main():
                 return
             if link.begin_timed_run(int(key) - 1, key):
                 print(f"-> sent '{key}'  ({COMMANDS[key]})")
-        elif key in SAFETY_OVERRIDE_KEYS:
-            if link.run_in_progress():
-                sent = link.connected and link.send_command(key)
-                link.end_run_override()
-                if sent:
-                    print(f"-> sent '{key}'  ({COMMANDS[key]})")
-            elif link.send_command(key):
-                print(f"-> sent '{key}'  ({COMMANDS[key]})")
-        elif key in MOTION_OVERRIDE_KEYS:
-            if link.run_in_progress():
-                link.end_run_override()
-            if link.send_command(key):
-                print(f"-> sent '{key}'  ({COMMANDS[key]})")
+        elif key in SAFETY_OVERRIDE_KEYS or key in MOTION_OVERRIDE_KEYS:
+            link.send_command(key)
         elif key in COMMANDS:
             if link.send_command(key):
                 print(f"-> sent '{key}'  ({COMMANDS[key]})")
@@ -1146,7 +1224,7 @@ def main():
     raw_line, = ax_flow.plot([], [], lw=1, color="#a9c6e8", alpha=0.6, label="raw")
     avg_line, = ax_flow.plot([], [], lw=2, color="#1f6feb", label=f"smoothed (avg {args.avg})")
     target_line, = ax_flow.plot([], [], lw=1.2, ls="--", color="#7b1fa2",
-                                label="commanded target")
+                                label="geometric target (local L/min)")
     # Adaptive opening/exit levels follow the current phase target. The peak
     # detector latches them per excursion; these lines are a live preview.
     threshold_guides = []
@@ -1228,7 +1306,7 @@ def main():
                       f"DISCONNECTED: {link.connection_error or 'reader stopped'}")
         flow_status.set_text(
             f"flow: {flow_avg[-1]:7.2f} slm   "
-            f"target: {target_flow[-1]:7.2f} slm   "
+            f"geometric target: {target_flow[-1]:7.2f} local L/min   "
             f"threshold: {current_threshold:5.2f} slm   "
             f"phase: {PHASE_NAMES.get(phase[-1], phase[-1])}\n"
             f"[{'OK' if flow_ok[-1] else 'SENSOR FAULT'}; "

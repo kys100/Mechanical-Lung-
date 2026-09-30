@@ -21,3 +21,35 @@ class FakeSerial:
 def link(**kwargs):
     with patch.object(logger.serial, 'Serial', FakeSerial), patch.object(logger.threading.Thread, 'start'):
         return logger.SerialLink('fake', 115200, 1, **kwargs)
+
+RID = '0123456789abcdef'
+def wire(seq=0, flow=0, phase=0, preset=0, run_id=RID, flow_ok=1,
+         scan_id=None, row_us=None, cycle_id=3, age=100, **overrides):
+    p = ['DATA2', str(seq), str((1000000+seq*10000)//1000), str(flow), str(flow_ok), str(age if flow_ok else -1)]
+    p += ['20']*7 + ['25'] + ['1']*7 + ['100']*7
+    p += ['1450','1450','0','0','0','10',str(phase),str(preset),'0']
+    p += [run_id,str(seq+1 if scan_id is None else scan_id),str(1000000+seq*10000 if row_us is None else row_us),str(cycle_id),str(1000000+seq*10000-500), '0','0']
+    for index, value in overrides.items(): p[int(index)] = str(value)
+    return ','.join(p)
+
+def ready(s):
+    s._handle_marker('# PROTOCOL,2')
+    s._handle_marker('# META_BEGIN,2,test')
+    for key in sorted(logger.META_KEYS):
+        s._handle_marker(f'# META,2,{key},test')
+    s._handle_marker('# META_END,2,test')
+    s._handle_marker('# READY_QUERY')
+
+class FakeTimer:
+    def __init__(self,*args,**kwargs): self.daemon=False
+    def start(self): pass
+    def cancel(self): pass
+
+def recording(s, directory):
+    ready(s)
+    s.run_id=RID; s.mode='P0'; s.state='STARTING'
+    with patch.object(logger, 'RECORDINGS_DIR', directory):
+        paths=s.start_recording(0)
+    with patch.object(logger.threading, 'Timer', FakeTimer):
+        s._handle_marker(f'# STARTED,2,{RID},P0,1000,1000000')
+    return paths
