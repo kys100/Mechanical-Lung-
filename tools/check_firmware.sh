@@ -7,4 +7,5 @@ task_build=$(mktemp -d)
 trap 'rm -rf "$task_build"' EXIT
 mkdir "$task_build/MechLung"
 cp MechLung.ino "$task_build/MechLung/MechLung.ino"
-"$cli" compile --fqbn arduino:renesas_uno:unor4wifi --warnings all --build-path "$task_build/build" "$task_build/MechLung"
+build_id=$(sha256sum MechLung.ino | cut -d' ' -f1)
+"$cli" compile --build-property "compiler.cpp.extra_flags=-DMECH_BUILD_ID=\"$build_id\"" --fqbn arduino:renesas_uno:unor4wifi --warnings all --build-path "$task_build/build" "$task_build/MechLung"

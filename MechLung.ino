@@ -1,136 +1,8 @@
-// =============================================================================
-//  MechLung.ino — Arduino UNO R4 WiFi
-//  Full sensor suite (SFM3000 flow + 7x SDP811 pressure, from MechLung_Final)
-//  driven through the actuator architecture from FlowTestingPY:
-//  register-bounded DAC writes, position-feedback telemetry, demo sine, expanded
-//  serial command set, and the more robust SFM3000 handling. Travel safety
-//  itself is not this sketch's job — see the note above writeActuatorDac().
-//
-//  This is a merge of two sketches, not a straight copy of either:
-//    - MechLung_Final.ino     — full 2-bus sensor suite, clinical presets
-//    - FlowTestingPY.ino      — position feedback, demo sine, expanded commands,
-//                                SFM3000 hardening
-//
-//  MERGE DECISIONS WORTH KNOWING ABOUT
-//  ─────────────────────────────────────────────────────────────────────────
-//  - Sensor reads (flow AND all 7 pressures) run in their own SENSOR_CYCLE_US
-//    gate, separate from the actuator's tick-gated block — same structure as
-//    MechLung_Final. FlowTestingPY read its single fast SFM3000 transaction
-//    inside the tick-gated block; that does NOT scale to the 7-sensor mux
-//    array, which needs many I2C transactions per scan. Before R8, a blocking
-//    channel reinit alone could take ~26ms; runtime recovery is now spread
-//    across loop passes for the same reason (see R8). Although the sensor
-//    cycle and the actuator tick share a 10ms period (R15), they are gated
-//    independently.
-//  - The CSV "DATA" row only prints while a run is active (current_preset
-//    != -1, i.e. a clinical preset OR demo sine) — same "don't log idle"
-//    gate MechLung_Final used, extended to also cover demo sine.
-//  - i2cBusRecovery() (boot-time stuck-bus clear) is kept on the main bus.
-//    Both buses also use an explicit 5ms per-transaction timeout. The old
-//    Renesas timeout-loop bug (arduino/ArduinoCore-renesas#66) is fixed in
-//    the current core; bounding each transaction keeps a bus fault from
-//    indefinitely holding the single actuator/sensor loop.
-//  - No "wait for Python logger" handshake in setup() (MechLung_Final had
-//    one). FlowTestingPY's whole ordering philosophy is "never let setup()
-//    block on an external party" — keeping a blocking handshake here would
-//    work against that.
-//
-//  REVISION NOTES (this version)
-//  ─────────────────────────────────────────────────────────────────────────
-//  R1. DATA rows are emitted on a FIXED LOG_RATE_HZ cadence instead of once
-//      per loop() pass. Previously the log interval was "however long the
-//      last loop happened to take", which is neither constant nor known —
-//      that irregular spacing quietly corrupts anything computed against
-//      time downstream (peak timing, dP/dt, resampling, spectra), and at
-//      full loop speed it also generated rows faster than the link could
-//      drain them. The current wire format is documented in printBanner().
-//  R2. The sensor cycle is paced by SENSOR_CYCLE_US rather than free-running
-//      flat out. Hammering the mux as fast as loop() allows re-reads the
-//      SDP811s far faster than they update, and starves the actuator tick of
-//      loop passes for no benefit.
-//  R3. REMOVED — position feedback is telemetry only. The former slow bias
-//      trim changed the commanded waveform based on A1 feedback; command and
-//      measured position are now logged independently without feedback
-//      modifying the DAC output.
-//  R4. REMOVED — the SAFE_FEEDBACK-derived software travel clamp, and the
-//      boot-time check that warned when a preset's peak command would clip
-//      against it. That clamp was sized around an earlier, shorter prototype
-//      chamber and had not been revisited since, so it silently narrowed the
-//      piston's usable range for every geometry that came after it. It was
-//      also duplicated work: the Jrk G2's own Input scaling, set in the Jrk
-//      Configuration Utility, maps whatever voltage the Arduino's DAC puts
-//      out onto the actuator's real safe travel — so the DAC value the
-//      firmware writes is always confined by the Jrk regardless of what the
-//      firmware itself thinks the limits are. A second, independent,
-//      possibly-stale copy of that limit in firmware doesn't add safety; it
-//      only adds a second place for the two numbers to disagree, and this
-//      was that disagreement. The one bound still enforced in firmware is
-//      writeActuatorDac()'s constrain to [0, 4095] — the 12-bit DAC
-//      register's addressable range, not a travel limit — see the note
-//      above that function.
-//  R5. SFM3000 gets the same consecutive-failure re-init the SDP811 array
-//      already had, so a transient main-bus glitch doesn't kill flow data
-//      for the rest of the session.
-//  R6. New commands: 'm' toggles the human-readable Monitor block (so it can
-//      be silenced during a logged run), '?' reprints the banner.
-//  R7. Printed precision trimmed to what the sensors actually resolve
-//      (SFM3000 ~0.007 slm, SDP811 ~0.017 Pa), cutting row length by ~20%.
-//  R8. Runtime sensor recovery is non-blocking. Pressure-channel recovery is
-//      spread across loop passes, and SFM3000's 100ms conversion wait is now
-//      a timed state rather than delay(100), so recovery cannot deliberately
-//      suspend the 100Hz actuator tick.
-//  R9. SFM3000 boot/recovery failures retry once per second instead of
-//      permanently disabling flow reads after the first failed init.
-//  R10. The Python logger sends an internal '!' heartbeat. A run started
-//       while those heartbeats are present returns to centre if they stop;
-//       runs started from a plain Serial Monitor remain autonomous.
-//  R11. Wire and Wire1 transactions are explicitly bounded to 5ms. This
-//       replaces reliance on the core's much longer default timeout.
-//  R12. Clinical profiles use raised-cosine position ramps, giving zero
-//       velocity at both ends of each stroke without changing peak flow.
-//  R13. DATA logging runs at 100Hz over the UNO R4 WiFi native USB CDC link
-//       and includes DAC command counts plus A1-derived feedback counts.
-//       This rate is not intended for a 115200-baud hardware UART.
-//  R14. 'c'/'C' (alias for hold) removed — H/h/0 already do this.
-//  R15. Each 100Hz DATA row now carries the commanded instantaneous/peak
-//       flow, breath phase, and per-sensor sample ages. Sensor acquisition is
-//       phase-aligned one-for-one with DATA rows so peak-pressure records can
-//       be checked for freshness and inter-channel timing skew.
-//  R16. DATA cadence resynchronization is exact at the missed-deadline
-//       boundary. The log deadline advances by one interval (phase-locked);
-//       if the row is then still a full interval or more overdue, the
-//       deadline resynchronizes to "now" and the backlog is skipped instead
-//       of being replayed as a burst of rows from one sensor scan.
-//  R17. actuator_clamped is sticky for one MOTION SESSION, which begins in
-//       either startPreset() or startDemoSine(). Both starters clear it, so
-//       a rail hit during one session never appears in the next session's
-//       DATA rows.
-//
-//  Two buses:
-//    Wire   (main bus)  — SFM3000 flow sensor only
-//    Wire1  (Qwiic bus) — 7 x SDP811 via PCA9548 mux, channels 0-6 (ch 7 unused)
-//                          Naming: mux channel N -> "Psens(N+1)"
-//
-//  SERIAL OUTPUT — two audiences on one serial link (native USB CDC):
-//    - "DATA,..." CSV line at LOG_RATE_HZ, only while a run is active —
-//      for the companion logging/plotting script.
-//    - A throttled, human-readable Monitor block for the Serial Monitor.
-//
-//  SERIAL COMMANDS (all single-byte, no newline needed)
-//  ─────────────────────────────────────────────────────────────────────────
-//  1-4        clinical preset — sets breath rate/amplitude and starts a new
-//             motion session: resets seq, the clamp flag and the feedback
-//             filter, then starts logging.
-//  s, S       demo sine — full-range motion demo, not physiologically
-//             meaningful. Also starts a new motion session (same resets).
-//  H, h, 0    hold at DAC_CENTRE / go idle. Logging stops.
-//  X, x       hold at CALIBRATION_TARGET_JRK_SCALE — a second, fixed point
-//             distinct from centre, used for pot calibration.
-//  m, M       toggle the Monitor block on/off.
-//  ?          reprint the banner / command help.
-//  !          logger heartbeat (internal; arms the host watchdog).
-// =============================================================================
-
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <initializer_list>
+// Protocol 2: bounded transport and one I2C transaction per loop pass.
 #include <Wire.h>
 
 // VERIFY: Confirm pins 27/26 against the installed Renesas core before relying on these fallbacks; if that core exposes the pins as non-macro identifiers, these macros can silently shadow its real values.
@@ -332,7 +204,7 @@ static bool timeReachedUs(uint32_t now_us, uint32_t due_us) {
 // Start continuous conversion without waiting for the first sample. Runtime
 // recovery uses this split phase so the actuator loop keeps running during
 // the sensor's mandatory 100ms conversion delay.
-static void sfm3000BeginRecovery(uint32_t now_us) {
+static void sfm3000BeginRecovery(uint32_t /*now_us*/) {
   sfm_ok = false;
   flow_sensor_ok = false;
 
@@ -341,10 +213,10 @@ static void sfm3000BeginRecovery(uint32_t now_us) {
   Wire.write(0x00);
   if (Wire.endTransmission() == 0) {
     sfm_recovery_state = SFM_RECOVERY_DISCARD_WAIT;
-    sfm_recovery_due_us = now_us + 100000UL;
+    sfm_recovery_due_us = micros() + 100000UL;
   } else {
     sfm_recovery_state = SFM_RECOVERY_RETRY_WAIT;
-    sfm_recovery_due_us = now_us + SFM_RETRY_INTERVAL_US;
+    sfm_recovery_due_us = micros() + SFM_RETRY_INTERVAL_US;
   }
 }
 
@@ -363,7 +235,7 @@ static void sfm3000Service(uint32_t now_us) {
       return;
     }
     sfm_recovery_state = SFM_RECOVERY_RETRY_WAIT;
-    sfm_recovery_due_us = now_us + SFM_RETRY_INTERVAL_US;
+    sfm_recovery_due_us = micros() + SFM_RETRY_INTERVAL_US;
     return;
   }
 
@@ -372,10 +244,17 @@ static void sfm3000Service(uint32_t now_us) {
 }
 
 static bool sfm3000ReadRaw(uint16_t &raw_out) {
-  if (Wire.requestFrom((int)SFM3000_I2C_ADDR, 2) != 2) return false;
-  if (Wire.available() < 2) return false;
+  if (Wire.requestFrom((int)SFM3000_I2C_ADDR, 3) != 3) return false;
+  if (Wire.available() < 3) return false;
   const uint8_t hi = Wire.read();
   const uint8_t lo = Wire.read();
+  // SFM3xxx CRC: polynomial 0x31, initial value 0x00 (SDP uses 0xff).
+  uint8_t crc = 0;
+  for (uint8_t byte : {hi, lo}) {
+    crc ^= byte;
+    for (uint8_t b = 0; b < 8; ++b) crc = crc & 0x80 ? (crc << 1) ^ 0x31 : crc << 1;
+  }
+  if (crc != (uint8_t)Wire.read()) return false;
   raw_out = ((uint16_t)hi << 8) | lo;
   return true;
 }
@@ -394,32 +273,14 @@ static bool sfm3000ReadFlow() {
   if (++sfm_consecutive_fails >= SFM_FAIL_REINIT_THRESHOLD) {
     sfm_consecutive_fails = 0;
     sfm_reinit_count++;
-    sfm3000BeginRecovery(micros());
+    sfm_ok = false;
+    sfm_recovery_state = SFM_RECOVERY_RETRY_WAIT;
+    sfm_recovery_due_us = micros();
   }
   return false;
 }
 
 // One-shot diagnostic — only called from setup() if sfm3000Init() fails.
-static void i2cScan() {
-  Serial.println(F("# I2C scan (main bus):"));
-  int found = 0;
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    const uint8_t err = Wire.endTransmission();
-    if (err == 0) {
-      Serial.print(F("#   device found at 0x"));
-      if (addr < 16) Serial.print('0');
-      Serial.println(addr, HEX);
-      found++;
-    }
-  }
-  if (found == 0) {
-    Serial.println(F("#   nothing responded at all — check VDD (5V), GND, "
-                     "and that SDA/SCL are actually the pins Wire.begin() "
-                     "is using on this board"));
-  }
-}
-
 static bool sfm3000Init() {
   Wire.beginTransmission(SFM3000_I2C_ADDR);
   Wire.write(0x10);
@@ -453,7 +314,7 @@ static const uint8_t SDP_ADDR = 0x26;   // all 7 SDP811s share this address
 static const int NUM_PSENS = 7;          // mux channels 0-6; channel 7 unused
 
 static const uint8_t CMD_START_HI = 0x36;
-static const uint8_t CMD_START_LO = 0x1E;  // diff. pressure, no temp comp, no averaging
+static const uint8_t CMD_START_LO = 0x1E;  // differential-pressure temperature compensation, no averaging
 static const uint8_t CMD_STOP_HI  = 0x3F;
 static const uint8_t CMD_STOP_LO  = 0xF9;
 
@@ -552,114 +413,6 @@ static bool initPsensChannel(uint8_t channel) {
   delay(1);
   if (!sdpStart()) return false;
   return true;
-}
-
-static void beginPsensRecovery(uint8_t channel, uint32_t now_us) {
-  SdpSensor &s = psens[channel];
-  s.ok = false;
-  s.reinit_count++;
-
-  if (muxSelect(channel)) {
-    sdpStop();
-    s.recovery_state = SDP_RECOVERY_WAIT_START;
-    s.recovery_due_us = now_us + 1000UL;
-  } else {
-    s.recovery_state = SDP_RECOVERY_RETRY_WAIT;
-    s.recovery_due_us = now_us + SDP_RECOVERY_RETRY_US;
-  }
-}
-
-// Returns true only when the channel is ready for a normal read. Every state
-// transition is bounded to one short I2C transaction; mandatory waits happen
-// between loop passes instead of inside delay().
-static bool servicePsensRecovery(uint8_t channel, uint32_t now_us) {
-  SdpSensor &s = psens[channel];
-  if (s.recovery_state == SDP_RECOVERY_IDLE) return true;
-  if (!timeReachedUs(now_us, s.recovery_due_us)) return false;
-
-  if (s.recovery_state == SDP_RECOVERY_WAIT_START) {
-    if (muxSelect(channel) && sdpStart()) {
-      s.recovery_state = SDP_RECOVERY_WAIT_READY;
-      s.recovery_due_us = now_us + 25000UL;
-    } else {
-      s.recovery_state = SDP_RECOVERY_RETRY_WAIT;
-      s.recovery_due_us = now_us + SDP_RECOVERY_RETRY_US;
-    }
-    return false;
-  }
-
-  if (s.recovery_state == SDP_RECOVERY_WAIT_READY) {
-    s.recovery_state = SDP_RECOVERY_IDLE;
-    s.consecutive_fails = 0;
-    return true;
-  }
-
-  beginPsensRecovery(channel, now_us);
-  return false;
-}
-
-// One-shot diagnostic — scans Wire1 (the Qwiic/mux bus) for any responding
-// address. Called from setup() if every channel fails to init, so a wiring/
-// power problem on this bus shows up the same way i2cScan() surfaces one on
-// the main bus for the SFM3000. Note: with the mux idle (no channel
-// selected), only the mux itself (0x70) is expected to answer — the SDP811s
-// sit behind it and won't ACK until a channel is selected.
-static void i2cScanWire1() {
-  Serial.println(F("# I2C scan (Wire1 / Qwiic / mux bus):"));
-  int found = 0;
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire1.beginTransmission(addr);
-    const uint8_t err = Wire1.endTransmission();
-    if (err == 0) {
-      Serial.print(F("#   device found at 0x"));
-      if (addr < 16) Serial.print('0');
-      Serial.println(addr, HEX);
-      found++;
-    }
-  }
-  if (found == 0) {
-    Serial.println(F("#   nothing responded at all on Wire1 — check the "
-                     "Qwiic cable into the mux board, that the mux is "
-                     "powered, and that nothing upstream of it is loose"));
-  } else {
-    Serial.println(F("#   (expect 0x70 = mux; SDP811s at 0x26 won't ACK "
-                     "here since no channel is selected)"));
-  }
-}
-
-// Reads all 7 channels for one cycle. Returns the count of successful reads.
-static int readAllPsens(uint32_t now_us) {
-  int success_count = 0;
-
-  for (uint8_t ch = 0; ch < NUM_PSENS; ch++) {
-    SdpSensor &s = psens[ch];
-
-    if (!servicePsensRecovery(ch, now_us)) {
-      s.ok = false;
-      continue;
-    }
-
-    bool read_ok = false;
-    if (muxSelect(ch)) {
-      read_ok = sdpRead(s.pressure_pa, s.temp_c);
-    }
-
-    s.ok = read_ok;
-
-    if (read_ok) {
-      s.sample_us = micros();
-      s.consecutive_fails = 0;
-      success_count++;
-    } else {
-      s.consecutive_fails++;
-      if (s.consecutive_fails >= CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
-        s.consecutive_fails = 0;
-        beginPsensRecovery(ch, now_us);
-      }
-    }
-  }
-
-  return success_count;
 }
 
 // Mean temperature across whichever channels succeeded this cycle.
@@ -847,26 +600,6 @@ static void initPresets() {
 //  against the Jrk's own configured Input scaling before a run.
 // =============================================================================
 
-static void reportGeometrySummary() {
-  const int peak_cmd = corrected_centre_dac + presets[0].a_dac_corr;
-
-  Serial.print(F("# Geometry: Vt="));
-  Serial.print(V_TIDAL_ML, 0);
-  Serial.print(F(" mL at bore "));
-  Serial.print(CYLINDER_DIAMETER_MM, 0);
-  Serial.print(F(" mm -> stroke amplitude A="));
-  Serial.print(presets[0].a_mm, 1);
-  Serial.print(F(" mm, peak DAC "));
-  Serial.print(peak_cmd);
-  Serial.print(F(" (centre "));
-  Serial.print(corrected_centre_dac);
-  Serial.println(F(")."));
-  Serial.println(F("# Cross-check this against the Jrk G2's configured "
-                   "Input scaling before running a preset — firmware does "
-                   "not read that configuration back and cannot detect a "
-                   "mismatch itself."));
-}
-
 // =============================================================================
 //  ACTUATOR TIMING — 100Hz, matching the Jrk G2's default 10ms PID period.
 //  Independent of the sensor cycle and of the log cadence.
@@ -878,8 +611,6 @@ static int      current_preset = -1;  // -1 idle, -2 demo sine, 0-3 presets
 // VERIFY: phi_us remains float because changing it alone would still narrow through float preset periods and fmodf(); confirm its float-ULP resolution near preset 1's longest period is acceptable on the rig before making a coordinated double-precision change.
 static float    phi_us         = 0.0f;
 static uint32_t last_dac_us    = 0;
-static uint32_t last_log_us    = 0;
-static uint32_t last_sensor_us = 0;
 
 static float last_feedback_dac = 0.0f;  // scaled A1 reading from the last tick
 
@@ -901,7 +632,7 @@ static int stepDac(float phi) {
   return writeActuatorDac((int)(profile_dac + 0.5f));
 }
 
-// The profile's volume derivative, expressed as standard L/min. Phase 0 is
+// The profile's volume derivative, expressed as geometric local L/min. Phase 0 is
 // the longer expiration stroke; phase 1 is the faster inspiration stroke.
 // The 2:1 timing ratio means expiration intentionally peaks at half the
 // preset's named peak while inspiration reaches the named peak.
@@ -956,412 +687,336 @@ static int stepDemoSine(float phi) {
   return writeActuatorDac((int)(dac_out_unclamped + 0.5f));
 }
 
-// =============================================================================
-//  SERIAL COMMAND HANDLER
-// =============================================================================
+// Fixed storage: eight 640-byte records (~5.2 KiB). Two slots are reserved
+// for STARTED/ENDED. No record is evicted after any of its bytes are sent.
+static const size_t TX_SIZE = 640;
+static const uint8_t TX_COUNT = 8;
+struct TxRecord { char bytes[TX_SIZE]; uint16_t size, offset; };
+static TxRecord tx[TX_COUNT];
+static uint8_t tx_head = 0, tx_count = 0;
+static uint32_t tx_dropped_total = 0;
+static char format_buffer[TX_SIZE];
+static bool enqueueText(const char *text, bool control = false) {
+  const size_t length = strlen(text);
+  if (length >= TX_SIZE || tx_count >= (control ? TX_COUNT : TX_COUNT - 2)) {
+    if (!control) ++tx_dropped_total;
+    return false;
+  }
+  TxRecord &r = tx[(tx_head + tx_count) % TX_COUNT];
+  memcpy(r.bytes, text, length); r.size = length; r.offset = 0; ++tx_count;
+  return true;
+}
+static bool enqueueFormat(bool control, const char *format, ...) {
+  va_list args; va_start(args, format);
+  const int n = vsnprintf(format_buffer, TX_SIZE, format, args); va_end(args);
+  if (n < 0 || n >= (int)TX_SIZE) { if (!control) ++tx_dropped_total; return false; }
+  return enqueueText(format_buffer, control);
+}
+static void serviceTx() {
+  if (!tx_count) return;
+  const int capacity = Serial.availableForWrite();
+  if (capacity <= 0) return;
+  TxRecord &r = tx[tx_head];
+  size_t n = r.size - r.offset;
+  if (n > 64) n = 64;
+  if (n > (size_t)capacity) n = capacity;
+  // Renesas 1.6.0: one writer; FIFO consumers can only free capacity.
+  // No flush, retry, or Serial boolean conversion (which calls tud_task).
+  const size_t sent = Serial.write((const uint8_t *)r.bytes + r.offset, n);
+  r.offset += sent;
+  if (r.offset == r.size) { tx_head = (tx_head + 1) % TX_COUNT; --tx_count; }
+}
 
-static uint32_t seq = 0;  // increments once per logged row
+static uint32_t seq = 0, scan_id = 0, cycle_id = 0, missed_slots_total = 0;
+static uint32_t slot_us = 0, phase_update_us = 0;
 static bool monitor_enabled = true;
-
-// The watchdog is deliberately opt-in: only receipt of the logger's internal
-// heartbeat arms it. Serial Monitor users can still start an autonomous run,
-// while logger-controlled runs fail to centre if the logger disappears.
-static const uint32_t HOST_HEARTBEAT_TIMEOUT_MS = 3000UL;
-static bool host_watchdog_armed = false;
+static const uint32_t HOST_HEARTBEAT_TIMEOUT_MS = 3000;
+static bool host_watchdog_armed = false, host_seen = false;
 static uint32_t last_host_heartbeat_ms = 0;
+static char run_id[17] = "", ended_id[17] = "", run_mode[5] = "";
+static char ended_marker[128] = "", started_marker[128] = "";
+static int64_t final_enqueued_seq = -1;
+static bool scan_active = false;
+static uint8_t scan_ch = 0, scan_done = 0, rotation = 0, sensor_step = 0;
+static uint32_t scan_start_us = 0;
+static int scan_phase = -1, scan_preset = -1, scan_dac = 0;
+static uint32_t scan_cycle = 0;
+static float scan_target = 0, scan_peak = 0, scan_feedback = 0;
+static void closeScan();
 
-static void printBanner();
-
-static void startPreset(int idx) {
-  current_preset = constrain(idx, 0, 3);
-  phi_us      = 0.0f;
-  seq         = 0;
-  actuator_clamped = false;
-  const uint32_t run_start_us = micros();
-  last_dac_us = run_start_us;
-  last_log_us = run_start_us;
-  last_sensor_us = run_start_us;
-  resetPositionFeedback();
-  last_feedback_dac = readPotAsDacEquivalent();
-  position_follow_error = (float)last_dac_out - last_feedback_dac;
-
-  const Preset &p = presets[current_preset];
-  Serial.print(F("# PRESET_START preset="));
-  Serial.print(current_preset + 1);
-  Serial.print(F(" Qpeak_Lmin="));  Serial.print(p.q_peak_Lmin, 0);
-  Serial.print(F(" RR_BPM="));      Serial.print(p.rr_bpm, 2);
-  Serial.print(F(" A_mm="));        Serial.print(p.a_mm, 2);
-  Serial.print(F(" Vt_mL="));       Serial.print(V_TIDAL_ML, 0);
-  Serial.print(F(" T_exp_s="));     Serial.print(p.t_exp_us  / 1e6f, 3);
-  Serial.print(F(" T_insp_s="));    Serial.print(p.t_insp_us / 1e6f, 3);
-  Serial.print(F(" log_Hz="));      Serial.print(LOG_RATE_HZ);
-  Serial.println();
+static void startMotion(int preset) {
+  current_preset = preset; phi_us = 0; seq = scan_id = cycle_id = missed_slots_total = 0;
+  actuator_clamped = false; scan_active = false; final_enqueued_seq = -1;
+  tx_dropped_total = 0;
+  slot_us = phase_update_us = last_dac_us = micros();
+  resetPositionFeedback(); last_feedback_dac = readPotAsDacEquivalent();
+  host_watchdog_armed = run_id[0] || (host_seen &&
+      (uint32_t)(millis() - last_host_heartbeat_ms) < HOST_HEARTBEAT_TIMEOUT_MS);
 }
-
-static void startDemoSine() {
-  current_preset = -2;
-  phi_us      = 0.0f;
-  seq         = 0;
-  actuator_clamped = false;
-  const uint32_t run_start_us = micros();
-  last_dac_us = run_start_us;
-  last_log_us = run_start_us;
-  last_sensor_us = run_start_us;
-  resetPositionFeedback();
-  last_feedback_dac = readPotAsDacEquivalent();
-  position_follow_error = (float)last_dac_out - last_feedback_dac;
-  Serial.print(F("# DEMO_SINE_START period_s="));
-  Serial.print(DEMO_SINE_PERIOD_US / 1e6f, 2);
-  Serial.print(F(" dac_range=["));
-  Serial.print(demo_sine_dac_min);
-  Serial.print(F(", "));
-  Serial.print(demo_sine_dac_max);
-  Serial.println(F("] (actual travel set by the Jrk's Input scaling, not by this range)"));
-}
-
+static void startPreset(int idx) { startMotion(constrain(idx, 0, 3)); }
+static void startDemoSine() { startMotion(-2); }
 static void goIdleHold() {
-  current_preset = -1;
-  host_watchdog_armed = false;
-  resetPositionFeedback();
-  holdCentre();
-  Serial.println(F("# HOLD centre (DAC_CENTRE), idle. Logging stopped."));
+  current_preset = -1; host_watchdog_armed = false; scan_active = false;
+  resetPositionFeedback(); holdCentre();
+}
+static void endSession(const char *reason) {
+  // Hold first; unclosed acquisition is deliberately abandoned. ENDED is a
+  // barrier behind all retained DATA2 frames, including a partially sent one.
+  goIdleHold();
+  if (!run_id[0]) return;
+  strcpy(ended_id, run_id);
+  snprintf(ended_marker, sizeof ended_marker, "# ENDED,2,%s,%ld,%s,%lu\n",
+           run_id, (long)final_enqueued_seq, reason, (unsigned long)tx_dropped_total);
+  enqueueText(ended_marker, true); run_id[0] = 0;
+}
+static bool validId(const char *id) {
+  if (strlen(id) != 16) return false;
+  for (uint8_t i = 0; i < 16; ++i)
+    if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return false;
+  return true;
+}
+static void handleFrame(char *line) {
+  char *first = strchr(line, ','); if (!first) return; *first++ = 0;
+  char *mode = strchr(first, ','); if (mode) *mode++ = 0;
+  if (!validId(first)) return;
+  if (!strcmp(line, "@PING") && !mode) {
+    if (run_id[0] && !strcmp(run_id, first)) last_host_heartbeat_ms = millis();
+  } else if (!strcmp(line, "@STOP") && !mode) {
+    if (run_id[0] && !strcmp(run_id, first)) endSession("host_stop");
+    else if (!strcmp(ended_id, first) && tx_count < TX_COUNT - 1) enqueueText(ended_marker, true);
+  } else if (!strcmp(line, "@START") && mode) {
+    const int preset = !strcmp(mode, "DEMO") ? -2 :
+      (strlen(mode) == 2 && mode[0] == 'P' && mode[1] >= '0' && mode[1] <= '3' ? mode[1]-'0' : -1);
+    if (preset == -1 || !strcmp(first, ended_id)) return;
+    if (run_id[0]) {
+      if (!strcmp(run_id, first) && !strcmp(run_mode, mode) && tx_count < TX_COUNT - 1)
+        enqueueText(started_marker, true);
+      return;
+    }
+    // Reserve STARTED plus a future ENDED before any motion.
+    if (tx_count > TX_COUNT - 2) return;
+    snprintf(started_marker, sizeof started_marker, "# STARTED,2,%s,%s,%lu,%lu\n",
+             first, mode, (unsigned long)millis(), (unsigned long)micros());
+    if (!enqueueText(started_marker, true)) return;
+    strcpy(run_id, first); strcpy(run_mode, mode);
+    host_seen = true; last_host_heartbeat_ms = millis();
+    startMotion(preset);
+  }
 }
 
-static void goCalibrationTarget() {
-  current_preset = -1;
-  resetPositionFeedback();
-  const int target = applyDacCorrection(CALIBRATION_TARGET_JRK_SCALE);
-  writeActuatorDac(target);
-  Serial.print(F("# CALIBRATION_TARGET jrk_scale_target="));
-  Serial.println(CALIBRATION_TARGET_JRK_SCALE);
+#ifndef MECH_BUILD_ID
+#define MECH_BUILD_ID "unknown"
+#endif
+// Values come from the same compiled constants as the waveform. The compile
+// script provides a source digest; it is provenance, not a binary signature.
+static int meta_step = -1;
+static uint32_t last_monitor_ms = 0;
+static bool serviceMeta() {
+  if (meta_step < 0 || tx_count >= TX_COUNT - 2) return false;
+  bool ok = false;
+  switch (meta_step) {
+    case 0: ok=enqueueText("# PROTOCOL,2\n"); break;
+    case 1: ok=enqueueFormat(false,"# META_BEGIN,2,%s\n",MECH_BUILD_ID); break;
+    case 2: ok=enqueueText("# META,2,core,renesas_uno_1.6.0\n"); break;
+    case 3: ok=enqueueFormat(false,"# META,2,tidal_ml,%.8g\n",V_TIDAL_ML); break;
+    case 4: ok=enqueueFormat(false,"# META,2,bore_mm,%.8g\n",CYLINDER_DIAMETER_MM); break;
+    case 5: ok=enqueueFormat(false,"# META,2,stroke_mm,%.8g\n",ACTUATOR_STROKE_MM); break;
+    case 6: ok=enqueueFormat(false,"# META,2,dac_centre,%d\n",DAC_CENTRE); break;
+    case 7: ok=enqueueFormat(false,"# META,2,dac_half_range,%d\n",DAC_HALF_RANGE); break;
+    case 8: ok=enqueueFormat(false,"# META,2,dac_corr_offset,%.8g\n",DAC_CORR_OFFSET); break;
+    case 9: ok=enqueueFormat(false,"# META,2,dac_corr_gain,%.8g\n",DAC_CORR_GAIN); break;
+    case 10: ok=enqueueFormat(false,"# META,2,pot_raw_centre,%.8g\n",POT_RAW_AT_CENTRE); break;
+    case 11: ok=enqueueFormat(false,"# META,2,pot_dac_per_adc,%.8g\n",POT_DAC_COUNTS_PER_ADC); break;
+    case 12: ok=enqueueFormat(false,"# META,2,calibration_target,%d\n",CALIBRATION_TARGET_JRK_SCALE); break;
+    case 13: ok=enqueueFormat(false,"# META,2,slot_us,%lu\n",(unsigned long)LOG_INTERVAL_US); break;
+    case 14: ok=enqueueFormat(false,"# META,2,sfm_scale,%.8g\n",SFM3000_SCALE_FLOW_AIR); break;
+    case 15: ok=enqueueText("# META,2,flow_reference,local_target_standard_293.15K_1013mbar_airN2\n"); break;
+    case 16: ok=enqueueFormat(false,"# META_END,2,%s\n",MECH_BUILD_ID); break;
+    default: ok=enqueueText("# READY_QUERY\n"); if(ok) meta_step=-2;
+  }
+  if (ok) ++meta_step;
+  return ok;
 }
-
-static void toggleMonitor() {
-  monitor_enabled = !monitor_enabled;
-  Serial.print(F("# MONITOR "));
-  Serial.println(monitor_enabled ? F("on") : F("off (DATA rows only)"));
-}
-
+static char rx_frame[64]; static uint8_t rx_length = 0;
+static bool rx_in_frame = false, rx_discard = false;
+static uint32_t rx_start_ms = 0;
 static void handleSerial() {
-  while (Serial.available()) {
-    const char c = (char)Serial.read();
-
-    switch (c) {
-      case '1': case '2': case '3': case '4':
-        startPreset(c - '1');
-        break;
-      case 's': case 'S':
-        startDemoSine();
-        break;
-      case 'H': case 'h': case '0':
-        goIdleHold();
-        break;
-      case 'X': case 'x':
-        goCalibrationTarget();
-        break;
-      case 'm': case 'M':
-        toggleMonitor();
-        break;
-      case '?':
-        printBanner();
-        Serial.println(F("# READY_QUERY"));
-        break;
-      case '!':
-        last_host_heartbeat_ms = millis();
-        host_watchdog_armed = true;
-        break;
-      default:
-        break;  // ignore stray/whitespace bytes outside a command
+  if (rx_in_frame && (uint32_t)(millis()-rx_start_ms) >= 250) rx_discard = true;
+  for (uint8_t budget=0; budget<32 && Serial.available(); ++budget) {
+    const char c = Serial.read();
+    if (rx_in_frame) {
+      if (c == '\n') {
+        if (!rx_discard) { rx_frame[rx_length]=0; handleFrame(rx_frame); }
+        rx_in_frame = rx_discard = false; rx_length = 0;
+      } else if (!rx_discard) {
+        if (rx_length >= sizeof(rx_frame)-1 || c < 32 || c > 126) rx_discard=true;
+        else rx_frame[rx_length++]=c;
+      }
+      continue;
+    }
+    if (c=='@') { rx_in_frame=true; rx_length=0; rx_frame[rx_length++]=c; rx_start_ms=millis(); continue; }
+    if (c=='?') { if (!run_id[0]) meta_step=0; continue; }
+    if (c=='!') { if (!run_id[0]) {host_seen=true;last_host_heartbeat_ms=millis();host_watchdog_armed=true;} continue; }
+    if (c=='m'||c=='M') {monitor_enabled=!monitor_enabled;continue;}
+    if ((c>='1' && c<='4') || c=='s'||c=='S'||c=='H'||c=='h'||c=='0'||c=='X'||c=='x') {
+      if (run_id[0]) endSession("manual_override");
+      if (c>='1' && c<='4') startPreset(c-'1');
+      else if (c=='s'||c=='S') startDemoSine();
+      else {goIdleHold(); if(c=='X'||c=='x') writeActuatorDac(applyDacCorrection(CALIBRATION_TARGET_JRK_SCALE));}
     }
   }
 }
 
-// =============================================================================
-//  SERIAL OUTPUT — Monitor block (throttled, human-readable)
-// =============================================================================
-
-static const uint32_t MONITOR_PRINT_INTERVAL_MS = 300;  // ~3.3 Hz
-static uint32_t last_monitor_print_ms = 0;
-
-static void printMonitorBlock(uint32_t now_ms, int dac_out, float actual_dac_equiv,
-                              float cmd_pct, float fdbk_pct,
-                              int psens_ok_count, float psens_temp_avg) {
-  Serial.println(F("--------------------------------------------------"));
-
-  Serial.print(F(" t=")); Serial.print(now_ms / 1000.0f, 1); Serial.print(F("s  preset="));
-  if (current_preset == -2) {
-    Serial.println(F("demo-sine"));
-  } else if (current_preset == -1) {
-    Serial.println(F("idle/hold"));
-  } else {
-    Serial.print(current_preset + 1);
-    Serial.print(F(" (Q="));
-    Serial.print(presets[current_preset].q_peak_Lmin, 0);
-    Serial.println(F(" L/min)"));
+// Each pass is SELECT or a single sensor READ/STOP/START. A slot timeout
+// abandons the old scan; rotation prevents later mux channels starving.
+static void serviceSensors() {
+  if (!scan_active) return;
+  if (sensor_step==0) { sfm3000Service(micros()); sensor_step=1; return; }
+  SdpSensor &s=psens[scan_ch];
+  if (sensor_step==1) {
+    if (s.recovery_state!=SDP_RECOVERY_IDLE && !timeReachedUs(micros(),s.recovery_due_us)) {
+      sensor_step=3;
+    } else if (!muxSelect(scan_ch)) {
+      if (++s.consecutive_fails >= CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
+        s.consecutive_fails=0; s.recovery_state=SDP_RECOVERY_RETRY_WAIT; s.recovery_due_us=micros()+SDP_RECOVERY_RETRY_US;
+      }
+      sensor_step=3;
+    } else sensor_step=2;
+    return;
   }
-
-  Serial.print(F(" Flow      : "));
-  if (flow_sensor_ok) {
-    Serial.print(flow_slm, 2);
-    Serial.print(F(" slm"));
-    if (sfm_reinit_count) {
-      Serial.print(F("   (reinits: ")); Serial.print(sfm_reinit_count); Serial.print(')');
+  if (sensor_step==2) {
+    if (s.recovery_state==SDP_RECOVERY_RETRY_WAIT) {
+      sdpStop(); ++s.reinit_count; s.recovery_state=SDP_RECOVERY_WAIT_START; s.recovery_due_us=micros()+1000;
+    } else if (s.recovery_state==SDP_RECOVERY_WAIT_START) {
+      const bool started=sdpStart(); s.recovery_state=started?SDP_RECOVERY_WAIT_READY:SDP_RECOVERY_RETRY_WAIT;
+      s.recovery_due_us=micros()+(started?25000:SDP_RECOVERY_RETRY_US);
+    } else {
+      s.recovery_state=SDP_RECOVERY_IDLE;
+      s.ok=sdpRead(s.pressure_pa,s.temp_c);
+      if(s.ok) {s.sample_us=micros();s.consecutive_fails=0;}
+      else if(++s.consecutive_fails>=CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
+        s.consecutive_fails=0;s.recovery_state=SDP_RECOVERY_RETRY_WAIT;s.recovery_due_us=micros();
+      }
     }
-    Serial.println();
-  } else {
-    Serial.println(F("-- sensor not responding (check wiring / I2C addr 0x40)"));
+    sensor_step=3; return;
   }
-
-  Serial.print(F(" Pressure  : ")); Serial.print(psens_ok_count); Serial.print(F("/7 ok, avg temp "));
-  Serial.print(psens_temp_avg, 1); Serial.print(F(" C"));
-  uint32_t total_reinits = 0;
-  for (uint8_t ch = 0; ch < NUM_PSENS; ch++) total_reinits += psens[ch].reinit_count;
-  if (total_reinits) { Serial.print(F(", reinits ")); Serial.print(total_reinits); }
-  Serial.println();
-
-  Serial.print(F(" Command   : ")); Serial.print(dac_out);
-  Serial.print(F(" DAC  (")); Serial.print(cmd_pct, 0); Serial.println(F("% of stroke)"));
-
-  Serial.print(F(" Feedback  : ")); Serial.print(actual_dac_equiv, 0);
-  Serial.print(F(" DAC  (")); Serial.print(fdbk_pct, 0); Serial.println(F("% of stroke)"));
-
-  Serial.print(F(" Follow err: ")); Serial.print(position_follow_error, 1);
-  Serial.println(F(" counts"));
-  Serial.print(F(" Clamped   : ")); Serial.println(actuator_clamped ? F("YES") : F("no"));
+  ++scan_done; scan_ch=(scan_ch+1)%NUM_PSENS; sensor_step=1;
+  if(scan_done==NUM_PSENS) closeScan();
 }
-
-static void printBanner() {
-  Serial.println(F("# ================================================="));
-  Serial.println(F("# MechLung — full sensor suite + Jrk-scaled actuator control"));
-  Serial.print  (F("# DATA line @ "));
-  Serial.print(LOG_RATE_HZ);
-  Serial.println(F(" Hz (only while a run is active): "
-                   "seq,millis,flow_slm,flow_ok,"
-                   "flow_age_us,Psens1_pa..Psens7_pa,"
-                   "psens_temp_c_avg,Psens1_ok..Psens7_ok,"
-                   "Psens1_age_us..Psens7_age_us,cmd_dac,feedback_dac,"
-                   "cmd_pct,fdbk_pct,target_flow_slm,target_peak_slm,"
-                   "phase,preset,clamped"));
-  Serial.println(F("# Commands: 1-4 preset | s demo sine | H hold | "
-                   "X calibration hold | m toggle monitor | ? this "
-                   "banner"));
-  Serial.println(F("# Readable summary (a few times/sec): open Tools > Serial "
-                   "Monitor instead (close any logging script first — only "
-                   "one program can hold the serial port at a time)."));
-  Serial.println(F("# ================================================="));
+// Check each append before advancing the cursor; truncated snprintf lengths
+// must never become out-of-bounds pointer arithmetic on the next append.
+static bool appendField(size_t &used, const char *format, ...) {
+  if (used >= TX_SIZE) return false;
+  va_list args;
+  va_start(args, format);
+  const int n = vsnprintf(format_buffer + used, TX_SIZE - used, format, args);
+  va_end(args);
+  if (n < 0 || (size_t)n >= TX_SIZE - used) return false;
+  used += n;
+  return true;
 }
-
-// =============================================================================
-//  setup()
-// =============================================================================
-
+static void closeScan() {
+  if (!scan_active) return;
+  scan_active = false;
+  const uint32_t row_us = micros();
+  if (scan_preset >= 0) {
+    int closure_phase;
+    float closure_peak;
+    const float total = phi_us + (float)(uint32_t)(row_us - phase_update_us);
+    const float period = presets[scan_preset].period_us;
+    commandedFlowSlm(fmodf(total, period), closure_phase, closure_peak);
+    if (closure_phase != scan_phase || total >= period) {
+      // No extra wire flag is needed: invalidate a mixed-phase snapshot.
+      flow_sensor_ok = false;
+      for (auto &sensor : psens) sensor.ok = false;
+    }
+  }
+  size_t used = 0;
+  bool fits = appendField(used, "%s,%lu,%lu,%.3f,%d,%ld,", run_id[0] ? "DATA2" : "DATA",
+      (unsigned long)seq, (unsigned long)millis(), flow_slm, flow_sensor_ok,
+      (long)sampleAgeUs(row_us, flow_sensor_ok, flow_sample_us));
+  int ok_count = 0;
+  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch) {
+    fits = fits && appendField(used, "%.3f,", psens[ch].pressure_pa);
+    ok_count += psens[ch].ok;
+  }
+  fits = fits && appendField(used, "%.2f,", averagePsensTemp(ok_count));
+  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch)
+    fits = fits && appendField(used, "%d,", psens[ch].ok);
+  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch)
+    fits = fits && appendField(used, "%ld,", (long)sampleAgeUs(row_us, psens[ch].ok, psens[ch].sample_us));
+  fits = fits && appendField(used, "%d,%.2f,%.2f,%.2f,%.3f,%.3f,%d,%d,%d",
+      scan_dac, scan_feedback, 100.0f * (scan_dac - corrected_centre_dac) / DAC_HALF_RANGE,
+      100.0f * (scan_feedback - corrected_centre_dac) / DAC_HALF_RANGE,
+      scan_target, scan_peak, scan_phase, scan_preset, actuator_clamped);
+  if (run_id[0])
+    fits = fits && appendField(used, ",%s,%lu,%lu,%lu,%lu,%lu,%lu", run_id,
+        (unsigned long)scan_id, (unsigned long)row_us, (unsigned long)scan_cycle,
+        (unsigned long)scan_start_us, (unsigned long)missed_slots_total, (unsigned long)tx_dropped_total);
+  fits = fits && appendField(used, "\n");
+  if (fits) {
+    if (enqueueText(format_buffer)) final_enqueued_seq = seq;
+  } else {
+    ++tx_dropped_total;
+  }
+  ++seq;
+}
+static void startScan(uint32_t now) {
+  scan_active=true; ++scan_id; scan_start_us=now; scan_done=0; sensor_step=0;
+  scan_ch=rotation; rotation=(rotation+1)%NUM_PSENS;
+  flow_sensor_ok=false; for(auto &s:psens) s.ok=false;
+  scan_cycle=cycle_id;scan_preset=current_preset;scan_dac=last_dac_out;scan_feedback=last_feedback_dac;
+  scan_target=commandedFlowSlm(phi_us,scan_phase,scan_peak);
+}
 void setup() {
-  Serial.begin(115200);
-  uint32_t t0 = millis();
-  while (!Serial && (millis() - t0 < 2000));
-
-  printBanner();
-  Serial.println(F("# (MechLung_Final sensors, FlowTestingPY actuator/feedback; "
-                   "travel safety enforced by the Jrk G2's own Input scaling)"));
-
-  // ---- Actuator first, unconditionally, before anything I2C-related ----
-  // Neither the SFM3000 nor the SDP811 array should be able to block the
-  // actuator's first command, so all actuator setup happens before any
-  // Wire.begin() call.
-  initPresets();
-  corrected_centre_dac = applyDacCorrection(DAC_CENTRE);
-
-  // DAC register bound — see the note above writeActuatorDac(): this is a
-  // hardware-register limit, not travel safety. Travel safety is the Jrk
-  // G2's job, via its own configured Input scaling; this sketch does not
-  // enforce or know that range, so there is nothing to compute here.
-  Serial.print(F("# DAC register range: ["));
-  Serial.print(DAC_REG_MIN); Serial.print(F(", "));
-  Serial.print(DAC_REG_MAX); Serial.println(F("] (hardware limit only — "
-                             "travel safety is enforced by the Jrk G2's "
-                             "configured Input scaling, not by firmware)"));
-
-  demo_sine_dac_min = DAC_REG_MIN + DEMO_SINE_MARGIN_DAC;
-  demo_sine_dac_max = DAC_REG_MAX - DEMO_SINE_MARGIN_DAC;
-
-  Serial.print(F("# Demo sine DAC range: ["));
-  Serial.print(demo_sine_dac_min); Serial.print(F(", "));
-  Serial.print(demo_sine_dac_max); Serial.println(F("]"));
-
-  reportGeometrySummary();
-
-  analogWriteResolution(12);
-  analogReadResolution(12);
-
-  holdCentre();
-  Serial.println(F("# Holding DAC_CENTRE — settling 2s..."));
-  delay(2000);
-
-  // ---- Sensors second, and unable to block the sketch ----
-  // Both Wire buses are brought up (recovery, begin, clock, timeout) before
-  // either sensor is touched. Only actuator setup runs earlier than this.
-  i2cBusRecovery();       // clear any SDA-held-low left over from a previous upload
-  Wire.begin();
-  Wire.setClock(200000);
-  Wire.setWireTimeout(I2C_TRANSACTION_TIMEOUT_US, false);
-  delay(100);
-
-  i2cBusRecovery1();      // clear any SDA1-held-low left over from a previous upload/reset
-  Wire1.begin();
-  Wire1.setClock(400000); // stuck-bus recovery is handled by i2cBusRecovery1() above, not by clock speed
-  Wire1.setWireTimeout(I2C_TRANSACTION_TIMEOUT_US, false);
-
-  sfm_ok = sfm3000Init();
-  sfm_recovery_state = SFM_RECOVERY_RETRY_WAIT;
-  sfm_recovery_due_us = micros() + SFM_RETRY_INTERVAL_US;
-  Serial.print(F("# SFM3000 init: "));
-  Serial.println(sfm_ok ? F("OK") : F("FAILED (check wiring / addr 0x40) — "
-                                      "continuing without flow data"));
-  if (!sfm_ok) i2cScan();
-
-  int psens_init_ok_count = 0;
-  for (uint8_t ch = 0; ch < NUM_PSENS; ch++) {
-    psens[ch].reinit_count = 0;
-    psens[ch].recovery_state = SDP_RECOVERY_IDLE;
-    psens[ch].recovery_due_us = 0;
-    bool ok = initPsensChannel(ch);
-    Serial.print(F("# Psens")); Serial.print(ch + 1);
-    Serial.print(F(" (mux ch ")); Serial.print(ch); Serial.print(F("): "));
-    Serial.println(ok ? F("OK") : F("FAILED"));
-    if (ok) psens_init_ok_count++;
+  // Centre precedes USB diagnostics and all I2C initialization.
+  initPresets();corrected_centre_dac=applyDacCorrection(DAC_CENTRE);
+  demo_sine_dac_min=DAC_REG_MIN+DEMO_SINE_MARGIN_DAC;demo_sine_dac_max=DAC_REG_MAX-DEMO_SINE_MARGIN_DAC;
+  analogWriteResolution(12);analogReadResolution(12);holdCentre();
+  Serial.begin(115200);delay(2000);
+  i2cBusRecovery();Wire.begin();Wire.setClock(200000);Wire.setWireTimeout(I2C_TRANSACTION_TIMEOUT_US,false);
+  i2cBusRecovery1();Wire1.begin();Wire1.setClock(400000);Wire1.setWireTimeout(I2C_TRANSACTION_TIMEOUT_US,false);
+  sfm_ok=sfm3000Init();sfm_recovery_due_us=micros()+SFM_RETRY_INTERVAL_US;
+  for(uint8_t ch=0;ch<NUM_PSENS;++ch) {
+    if(!initPsensChannel(ch)) psens[ch].recovery_state=SDP_RECOVERY_RETRY_WAIT;
     delay(25);
   }
-  if (psens_init_ok_count == 0) i2cScanWire1();
-
-  last_dac_us = micros();
-  last_monitor_print_ms = millis();
-
-  Serial.println(F("# Ready. Holding centre. Send 1-4 for a preset, s for "
-                   "a full-range demo sine, H to hold/idle, X to hold the "
-                   "calibration target."));
+  slot_us=phase_update_us=last_dac_us=micros();
+  enqueueText("# BOOT,2\n");
+  enqueueFormat(false, "# INIT,flow_ok=%d,geometry_ml=%.1f,dac_centre=%d\n", sfm_ok, V_TIDAL_ML, corrected_centre_dac);
 }
-
-// =============================================================================
-//  loop()
-// =============================================================================
-
 void loop() {
-  static int      last_ok_count  = 0;
-  static float    last_temp_avg  = 0.0f;
-
+  if(host_watchdog_armed && (uint32_t)(millis()-last_host_heartbeat_ms)>=HOST_HEARTBEAT_TIMEOUT_MS)
+    endSession("watchdog");
+  const uint32_t now=micros();
+  const uint32_t elapsed=now-slot_us;
+  if(elapsed>=LOG_INTERVAL_US) {
+    const uint32_t slots=elapsed/LOG_INTERVAL_US;slot_us+=slots*LOG_INTERVAL_US;missed_slots_total+=slots-1;
+    if(scan_active) closeScan();
+    if(current_preset!=-1) {
+      const float period=current_preset==-2?DEMO_SINE_PERIOD_US:presets[current_preset].period_us;
+      const float total=phi_us+(float)(uint32_t)(now-phase_update_us);
+      cycle_id+=(uint32_t)(total/period);phi_us=fmodf(total,period);
+      if(current_preset==-2) stepDemoSine(phi_us); else stepDac(phi_us);
+    }
+    phase_update_us=last_dac_us=now;
+    last_feedback_dac=readPotAsDacEquivalent();position_follow_error=last_dac_out-last_feedback_dac;
+    if(current_preset!=-1) startScan(now);
+  }
   handleSerial();
-
-  const uint32_t now_ms = millis();
-  if (host_watchdog_armed &&
-      (uint32_t)(now_ms - last_host_heartbeat_ms) >= HOST_HEARTBEAT_TIMEOUT_MS) {
-    const bool run_was_active = current_preset != -1;
-    host_watchdog_armed = false;
-    if (run_was_active) {
-      goIdleHold();
-      Serial.println(F("# HOST_WATCHDOG logger heartbeat lost; actuator returned to centre."));
+  serviceTx();
+  serviceMeta();
+  serviceSensors();
+  if (monitor_enabled && (uint32_t)(millis() - last_monitor_ms) >= 300 && tx_count < TX_COUNT - 3) {
+    last_monitor_ms = millis();
+    int pressure_ok_count = 0;
+    uint32_t pressure_reinits = 0;
+    for (const auto &sensor : psens) {
+      pressure_ok_count += sensor.ok;
+      pressure_reinits += sensor.reinit_count;
     }
-  }
-
-  const uint32_t now_us = micros();
-
-  // ── ACTUATOR — independent 100Hz tick ────────────────────────────────────
-  if ((uint32_t)(now_us - last_dac_us) >= DAC_TICK_US) {
-    const uint32_t elapsed = now_us - last_dac_us;
-    last_dac_us = now_us;
-
-    if (current_preset == -2) {
-      phi_us = fmodf(phi_us + (float)elapsed, DEMO_SINE_PERIOD_US);
-      stepDemoSine(phi_us);
-    } else if (current_preset >= 0) {
-      phi_us = fmodf(phi_us + (float)elapsed, presets[current_preset].period_us);
-      stepDac(phi_us);
-    } else {
-      // Idle/hold/calibration hold: don't reissue a command, just keep
-      // reading position feedback so H/X calibration holds stay live.
-    }
-
-    last_feedback_dac = readPotAsDacEquivalent();
-    position_follow_error = (float)last_dac_out - last_feedback_dac;
-  }
-
-  // ── SENSORS — one scan per actuator/log tick. This runs after the DAC
-  //    update and before the DATA row, so that row always carries the newest
-  //    available flow/pressure set. Per-sensor ages expose sequential skew.
-  if ((uint32_t)(now_us - last_sensor_us) >= SENSOR_CYCLE_US) {
-    last_sensor_us = now_us;
-    sfm3000Service(now_us);
-    last_ok_count = readAllPsens(now_us);
-    last_temp_avg = averagePsensTemp(last_ok_count);
-  }
-
-  // VERIFY: These percentages assume DAC_HALF_RANGE applies equally to corrected DAC commands and A1-derived feedback, while mmToDacCounts() uses it as a travel scale; a mismatch can shift tidal volume and peak flow by about 2.4%. Command a known DAC delta, measure piston travel with calipers, and determine which scale 1526 represents before treating these percentages as quantitative.
-  const float cmd_pct  = 100.0f * (float)(last_dac_out - corrected_centre_dac) / (float)DAC_HALF_RANGE;
-  const float fdbk_pct = 100.0f * (last_feedback_dac - (float)corrected_centre_dac) / (float)DAC_HALF_RANGE;
-  int breath_phase;
-  float target_peak_slm;
-  const float target_flow_slm = commandedFlowSlm(
-      phi_us, breath_phase, target_peak_slm);
-
-  // ── LOGGING — one merged CSV row at a FIXED LOG_RATE_HZ cadence (R1),
-  //    only while a run (preset or demo sine) is active. Idle/calibration
-  //    hold stays silent on this line, same as MechLung_Final's original
-  //    gate. Command and feedback counts are sampled by the actuator tick
-  //    immediately before this row whenever both 100Hz schedules are due.
-  //
-  //    Deadline handling (R16): last_log_us advances by exactly one interval
-  //    so the cadence stays phase-locked. If that leaves the row a full
-  //    interval or more overdue (>=, not >, so the exact-boundary case at two
-  //    elapsed intervals is included), the backlog is skipped by
-  //    resynchronizing to now_us rather than emitting a catch-up row from the
-  //    same sensor scan. Unsigned subtraction keeps this safe across micros()
-  //    wraparound.
-  if (current_preset != -1 &&
-      (uint32_t)(now_us - last_log_us) >= LOG_INTERVAL_US) {
-    last_log_us += LOG_INTERVAL_US;
-    if ((uint32_t)(now_us - last_log_us) >= LOG_INTERVAL_US) last_log_us = now_us;
-    const uint32_t row_us = micros();
-    const uint32_t row_ms = millis();
-
-    Serial.print(F("DATA,"));
-    Serial.print(seq);                       Serial.print(',');
-    Serial.print(row_ms);                    Serial.print(',');
-    Serial.print(flow_slm, 3);               Serial.print(',');
-    Serial.print(flow_sensor_ok ? 1 : 0);    Serial.print(',');
-    Serial.print(sampleAgeUs(row_us, flow_sensor_ok, flow_sample_us));
-    Serial.print(',');
-    for (uint8_t ch = 0; ch < NUM_PSENS; ch++) {
-      Serial.print(psens[ch].pressure_pa, 3);
-      Serial.print(',');
-    }
-    Serial.print(last_temp_avg, 2);          Serial.print(',');
-    for (uint8_t ch = 0; ch < NUM_PSENS; ch++) {
-      Serial.print(psens[ch].ok ? 1 : 0);
-      Serial.print(',');
-    }
-    for (uint8_t ch = 0; ch < NUM_PSENS; ch++) {
-      Serial.print(sampleAgeUs(row_us, psens[ch].ok, psens[ch].sample_us));
-      Serial.print(',');
-    }
-    Serial.print(last_dac_out);              Serial.print(',');
-    Serial.print(last_feedback_dac, 2);      Serial.print(',');
-    Serial.print(cmd_pct, 2);                Serial.print(',');
-    Serial.print(fdbk_pct, 2);               Serial.print(',');
-    Serial.print(target_flow_slm, 3);        Serial.print(',');
-    Serial.print(target_peak_slm, 3);        Serial.print(',');
-    Serial.print(breath_phase);              Serial.print(',');
-    Serial.print(current_preset);            Serial.print(',');
-    Serial.println(actuator_clamped ? 1 : 0);
-
-    seq++;
-  }
-
-  // ── MONITOR — throttled, independent of the tick and of the log gate,
-  //    so it still shows live status during idle/calibration holds. Can be
-  //    silenced with 'm' when the extra bytes are competing with DATA rows.
-  if (monitor_enabled &&
-      (uint32_t)(now_ms - last_monitor_print_ms) >= MONITOR_PRINT_INTERVAL_MS) {
-    last_monitor_print_ms = now_ms;
-    printMonitorBlock(now_ms, last_dac_out, last_feedback_dac,
-                      cmd_pct, fdbk_pct, last_ok_count, last_temp_avg);
+    enqueueFormat(false, "# MONITOR,preset=%d,flow_ok=%d,pressure_ok=%d,flow_reinits=%lu,pressure_reinits=%lu,clamped=%d\n",
+        current_preset, flow_sensor_ok, pressure_ok_count, (unsigned long)sfm_reinit_count,
+        (unsigned long)pressure_reinits, actuator_clamped);
   }
 }
