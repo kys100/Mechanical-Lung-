@@ -35,3 +35,24 @@ class Protocol(unittest.TestCase):
             s=link();recording(s,d);s._handle_data_line('DATA3,0')
             self.assertEqual(s.manifest['boundaries'][-1]['reason'],'malformed_data')
             s._fault('test_end')
+    def test_zero_rows_duplicate_end_and_final_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=link();recording(s,d)
+            s._handle_marker(f'# ENDED,2,{RID},-1,host_stop,0')
+            self.assertTrue(s.manifest['complete'])
+            s._handle_marker(f'# ENDED,2,{RID},999,host_stop,0')
+            self.assertTrue(s.manifest['complete'])
+        with tempfile.TemporaryDirectory() as d:
+            s=link();recording(s,d);s._handle_data_line(wire())
+            s._handle_marker(f'# ENDED,2,{RID},1,host_stop,0')
+            self.assertFalse(s.manifest['complete'])
+    def test_start_backlog_and_overflow(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=link();paths=recording(s,d)
+            s.state='STARTING';s._record_started=False
+            s._handle_data_line(wire(0,10));self.assertEqual(s._rows_written,0)
+            s.state='RUNNING';s._record_started=True
+            s.feed_bytes(b'DATA2,'+b'9'*1100+b'\n')
+            self.assertEqual(s._run_bad_lines,1)
+            s.feed_bytes((wire()+'\n').encode());self.assertEqual(s._rows_written,1)
+            s._fault('test_end')

@@ -111,7 +111,7 @@ def centred_moving_average(vals, window):
     if isinstance(window, bool) or not isinstance(window, Integral) or window < 1 or window % 2 == 0:
         raise ValueError("window must be a positive odd integer")
     half = window // 2
-    return [sum(vals[i-half:i+half+1]) / window
+    return [sum(value / window for value in vals[i-half:i+half+1])
             if half <= i < len(vals)-half else float('nan')
             for i in range(len(vals))]
 
@@ -262,8 +262,8 @@ class PeakFlowDetector:
             self.target_misses += target_met is False
             self.qualified_peaks += qualified is True
             self.unqualified_peaks += qualified is False
-            self.pressure_incomplete += not pressure_ok(peak_sample)
-            self.timing_failures += not timing_ok(peak_sample)
+            self.pressure_incomplete += not all(pressure_ok(s) for s in plateau)
+            self.timing_failures += not all(timing_ok(s) for s in plateau)
         ages = [a for ok,a in zip(peak_sample.pok,peak_sample.pa_age_us) if ok and a>=0]
         self.count += 1
         self.on_peak(dict(

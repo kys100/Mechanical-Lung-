@@ -99,3 +99,30 @@ class Control(unittest.TestCase):
             with patch.object(logger.time,'monotonic',lambda:clock[0]):
                 self.assertFalse(s.stop_run())
             self.assertLessEqual(clock[0],102.000001)
+    def test_heartbeat_stop_write_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=link();recording(s,d);s._heartbeat_enabled=True;s._last_heartbeat=-10
+            entered=threading.Event();release=threading.Event();original=s.ser.write
+            def write(data):
+                if data.startswith(b'@PING'):
+                    entered.set();self.assertTrue(release.wait(1))
+                return original(data)
+            s.ser.write=write
+            heartbeat=threading.Thread(target=s._send_heartbeat);heartbeat.start()
+            self.assertTrue(entered.wait(1))
+            def ack():s._handle_marker(f'# ENDED,2,{RID},-1,host_stop,0')
+            s._ended_event=CallbackEvent(ack)
+            stopper=threading.Thread(target=s.stop_run);stopper.start()
+            release.set();heartbeat.join(1);stopper.join(1)
+            self.assertFalse(stopper.is_alive());self.assertFalse(heartbeat.is_alive())
+            self.assertEqual([x.split(b',')[0] for x in s.ser.writes],[b'@PING',b'@STOP'])
+            s._last_heartbeat=-10;s._send_heartbeat();self.assertEqual(len(s.ser.writes),2)
+    def test_fault_requires_new_metadata_handshake(self):
+        s=link();ready(s);s._fault('test_fault')
+        s._handle_marker('# READY_QUERY')
+        self.assertEqual(s.state,'FAULTED');self.assertIsNone(s.metadata)
+        self.assertFalse(s._ready_event.is_set())
+        ready(s);self.assertEqual(s.state,'IDLE')
+    def test_ready_query_resynchronizes_partial_frame(self):
+        s=link();s.wait_until_ready(0)
+        self.assertEqual(s.ser.writes,[b'\n?'])

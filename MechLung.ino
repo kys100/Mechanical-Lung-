@@ -16,37 +16,16 @@
 // =============================================================================
 //  ACTUATOR CALIBRATION
 // =============================================================================
-//  Travel safety is NOT enforced here. It lives entirely in the Jrk G2's own
-//  Input scaling, configured through the Jrk Configuration Utility, which
-//  maps whatever voltage the Arduino's DAC outputs onto the actuator's real
-//  safe travel before the Jrk's PID ever acts on it. Firmware writing a
-//  value outside that mapping doesn't move the piston outside it — the Jrk
-//  confines it regardless. A previous version of this sketch also enforced
-//  a second, independent software clamp here (SAFE_FEEDBACK_MIN/MAX); it was
-//  sized around an earlier, shorter prototype chamber, was never revisited
-//  for later geometries, and duplicated a limit the Jrk already owns — see
-//  revision note R4 near the top of this file. It has been removed.
-//
-//  DAC_CENTRE below is therefore a plain calibration constant, not derived
-//  from any safety range: it is the Jrk feedback-scale value corresponding
-//  to the actuator's physical centre-of-stroke position, found the same way
-//  as any other calibration point (H hold, read back the Jrk's scaled
-//  feedback, adjust). Re-confirm it against the Jrk's currently configured
-//  Input scaling before relying on it — it was last set while that scaling
-//  still assumed the removed safety window, and Input scaling changes made
-//  independently of this sketch won't be reflected here automatically.
+// Travel control belongs to the configured Jrk. This sketch only limits the
+// hardware DAC register; it neither reads nor verifies Jrk travel settings.
+// DAC_CENTRE is inherited calibration, not a measured safety boundary.
 // VERIFY: DAC_CENTRE is inherited and unverified on this rig; re-derive it with the H/X hold pair before treating feedback_dac, fdbk_pct, or following error as quantitative.
 static const int   DAC_CENTRE         = 1450;
 static const float ACTUATOR_STROKE_MM = 300.0f;
 
-//  DAC_HALF_RANGE is the actuator scale factor: DAC counts corresponding to
-//  half the full mechanical stroke (ACTUATOR_STROKE_MM / 2). Everything that
-//  converts between millimetres and DAC counts — mmToDacCounts(), and the
-//  cmd_pct / fdbk_pct columns in the log — goes through it. It is a property
-//  of the actuator + Jrk scaling only, independent of the Input-scaling
-//  window configured in the Jrk Utility: cmd_pct/fdbk_pct report position as
-//  a percentage of the actuator's full mechanical stroke, not of whatever
-//  the Jrk is currently configured to permit.
+// DAC_HALF_RANGE is the inherited counts-per-half-stroke scale. Telemetry
+// percentages are 100 * corrected DAC offset / this value; they are not
+// independently measured percentages of full mechanical stroke.
 // VERIFY: DAC_HALF_RANGE is used for both mm-to-command conversion and corrected-DAC/A1 percentage normalization, which may be incompatible scales and can shift tidal volume and peak flow by about 2.4%. Command a known DAC delta, measure piston travel with calipers, and determine which scale 1526 represents before correcting either use.
 static const int   DAC_HALF_RANGE     = 1526;
 
@@ -69,25 +48,18 @@ static int applyDacCorrection(int jrk_desired) {
 // =============================================================================
 //  OUTPUT TIMING
 // =============================================================================
-//  LOG_RATE_HZ is the DATA row cadence. It is deliberately decoupled from
-//  both the actuator tick and the sensor cycle:
-//    - it must not be faster than SENSOR_CYCLE_US, or rows repeat readings;
-//    - it must be slow enough that the row bytes drain comfortably. At 100Hz
-//      the expanded row is at most roughly 22-23kB/s, comfortable on the
-//      UNO R4 WiFi's native USB CDC Serial link but exceeds a 115200-baud
-//      hardware UART's sustainable payload.
+// One slot coordinates the DAC tick, scan allocation and generated telemetry.
+// Missed slots are skipped and counted; USB may drop whole queued telemetry.
 static const uint32_t LOG_RATE_HZ   = 100;
 static const uint32_t LOG_INTERVAL_US = 1000000UL / LOG_RATE_HZ;
 
-//  One sensor scan is phase-aligned with each 100Hz DATA row. Reading faster
-//  than rows are recorded only adds mux/I2C load; both sensor families update
-//  much faster than 10ms in continuous mode. Per-channel ages in each row
-//  make the remaining sequential mux skew explicit instead of hiding it.
+// Each slot has a unique scan ID. Incomplete scans retain false validity
+// for unacquired channels. Per-channel ages expose sequential read timing.
 static const uint32_t SENSOR_CYCLE_US = LOG_INTERVAL_US;
 static const uint32_t I2C_TRANSACTION_TIMEOUT_US = 5000UL;
 
 // =============================================================================
-//  I2C BUS RECOVERY — main bus (Wire) only. The SFM3000 can be left
+//  I2C BUS RECOVERY — Wire; Wire1 has a corresponding helper below. The SFM3000 can be left
 //  mid-transfer holding SDA low across a sketch re-upload; this clears
 //  that before Wire.begin(). Must run before Wire.begin().
 // =============================================================================
@@ -125,7 +97,7 @@ static void i2cBusRecovery() {
 //  clock anything out). This runs before Wire1.begin(), same as the main
 //  bus's recovery does, so it doesn't touch the FSP I2C driver at all. It is
 //  therefore independent of the explicit 5ms transaction timeout that setup()
-//  applies afterwards (R11): the old Renesas timeout bug referenced in the
+//  applies afterwards: the old Renesas timeout bug referenced in the
 //  header was in the driver's runtime timeout handling, not in bit-banging
 //  the pins before begin().
 // =============================================================================
@@ -158,14 +130,13 @@ static void i2cBusRecovery1() {
 // =============================================================================
 //  Sensirion SFM3000, addr 0x40. flow[slm] = (raw - OFFSET) / SCALE.
 //  Protocol: issue "start continuous measurement" (0x1000) once at init,
-//  then just repeatedly read back the 2-byte flow word. Per the datasheet,
+//  then read the 2-byte flow word and its CRC byte. Per the datasheet,
 //  the very first measurement right after chip init is invalid and must be
 //  discarded — done once here in sfm3000Init().
 //
 //  On a failed read, flow_slm holds its last-good value (flow_sensor_ok
-//  reports which happened) so a single dropped I2C transaction doesn't put
-//  a spike/dropout in the trace. Past SFM_FAIL_REINIT_THRESHOLD consecutive
-//  failures the sensor is re-initialised (R5), mirroring what the SDP811
+//  reports which happened). The logger plots invalid readings as gaps. Past SFM_FAIL_REINIT_THRESHOLD consecutive
+//  failures the sensor is re-initialised, mirroring what the SDP811
 //  array already did — without it, one transient main-bus glitch left the
 //  flow channel dead for the rest of the session.
 // =============================================================================
@@ -284,7 +255,6 @@ static bool sfm3000ReadFlow() {
   return false;
 }
 
-// One-shot diagnostic — only called from setup() if sfm3000Init() fails.
 static bool sfm3000Init() {
   Wire.beginTransmission(SFM3000_I2C_ADDR);
   Wire.write(0x10);
@@ -300,8 +270,7 @@ static bool sfm3000Init() {
 
 // =============================================================================
 //  SDP811 × 7  (Wire1, Qwiic bus, via PCA9548 mux) — inherited from
-//  MechLung_Final (FlowTestingPY never touched this subsystem), with
-//  non-blocking runtime recovery (R8) and per-channel sample ages (R15) added.
+//  seven channels with incremental runtime recovery and per-channel ages.
 //
 //  Mux channel N -> "Psens(N+1)". Channel 7 unused. Reliability: scale
 //  factor read live (never hardcoded); muxSelect() checked before every
@@ -433,23 +402,8 @@ static float averagePsensTemp(int success_count) {
 // =============================================================================
 //  DAC REGISTER BOUND — NOT A TRAVEL-SAFETY LIMIT
 // =============================================================================
-//  This is a hardware-register bound, not a safety clamp: analogWriteResolution(12)
-//  makes A0 a 12-bit register, so any write outside [0, 4095] is simply an
-//  invalid value for that register. Travel safety itself is not this
-//  sketch's job — it is enforced entirely downstream, by the Input scaling
-//  configured in the Jrk G2 (Jrk Configuration Utility), which maps whatever
-//  voltage this DAC produces onto the actuator's real safe travel regardless
-//  of what firmware intended. Firmware previously duplicated that limit with
-//  its own SAFE_FEEDBACK_MIN/MAX-derived clamp; see revision note R4 near
-//  the top of this file for why that was removed.
-//
-//  A practical consequence: actuator_clamped below should be rare in normal
-//  operation, since nothing here should be computing values anywhere near
-//  the register's rails. If it does trip, that's a sign of a genuine bug —
-//  bad geometry or calibration constants, or similar — not routine travel
-//  limiting, so treat it as a fault indicator worth investigating rather
-//  than expected behaviour.
-// =============================================================================
+// A0 is a 12-bit DAC. Clamping a computed command is a sticky session fault
+// indicator. No feedback correction or firmware travel clamp is applied.
 
 static const int DAC_REG_MIN = 0;
 static const int DAC_REG_MAX = 4095;
@@ -536,7 +490,7 @@ static void resetPositionFeedback() {
 // =============================================================================
 //  PRESET STRUCT + CALCULATION — the stroke amplitude and timing per preset.
 //  The position profile applied to these values is stepDac()'s raised-cosine
-//  ramp (R12).
+//  ramp.
 // =============================================================================
 
 struct Preset {
@@ -597,16 +551,12 @@ static void initPresets() {
 //  This sketch has no visibility into what travel the Jrk G2 is currently
 //  configured to permit — that configuration lives in the Jrk itself (Jrk
 //  Configuration Utility, Input scaling) and firmware does not read it back.
-//  So unlike the removed R4 boot-time travel check (see the note near the
-//  top of this file), this print cannot tell you whether a preset's
-//  commanded stroke will clip: it just states the geometry firmware computed
-//  from V_TIDAL_ML and the cylinder bore, so it can be cross-checked by eye
-//  against the Jrk's own configured Input scaling before a run.
+//  Metadata states computed geometry, not proof of actual travel or volume.
 // =============================================================================
 
 // =============================================================================
 //  ACTUATOR TIMING — 100Hz, matching the Jrk G2's default 10ms PID period.
-//  Independent of the sensor cycle and of the log cadence.
+//  Shares the 100 Hz acquisition-slot deadline.
 // =============================================================================
 
 static const uint32_t DAC_TICK_US = 10000UL;  // 100 Hz
@@ -662,19 +612,14 @@ static float commandedFlowSlm(float phi, int &phase_out,
 }
 
 static int32_t sampleAgeUs(uint32_t now_us, bool valid, uint32_t sample_us) {
-  if (!valid || sample_us == 0) return -1;
+  if (!valid) return -1;
   return (int32_t)(now_us - sample_us);
 }
 
 // =============================================================================
 //  DEMO SINE — full-range motion demo, not physiologically meaningful.
-//  Sweeps nearly the full DAC register range, DEMO_SINE_MARGIN_DAC counts
-//  in from each rail. "Full-range" is now literal: with the old
-//  SAFE_FEEDBACK-derived clamp removed (see revision note R4), the actual
-//  motion this produces is whatever the Jrk's own configured Input scaling
-//  maps this sweep onto — the Jrk, not this constant, decides how far the
-//  piston actually travels. Triggered by 's'/'S'.
-// =============================================================================
+// Sweeps DAC register limits minus the margin. Actual travel depends on
+// external Jrk input scaling; firmware does not infer a mechanical limit.
 
 static const float DEMO_SINE_PERIOD_US = 3.0e6f;  // 3s/cycle
 static const int   DEMO_SINE_MARGIN_DAC = 100;     // keep a small margin off the register rails
@@ -695,7 +640,10 @@ static int stepDemoSine(float phi) {
 // for STARTED/ENDED. No record is evicted after any of its bytes are sent.
 static const size_t TX_SIZE = 640;
 static const uint8_t TX_COUNT = 8;
-struct TxRecord { char bytes[TX_SIZE]; uint16_t size, offset; };
+struct TxRecord {
+  char bytes[TX_SIZE];
+  uint16_t size, offset;
+};
 static TxRecord tx[TX_COUNT];
 static uint8_t tx_head = 0, tx_count = 0;
 static uint32_t tx_dropped_total = 0;
@@ -707,12 +655,17 @@ static bool enqueueText(const char *text, bool control = false, bool telemetry =
     return false;
   }
   TxRecord &r = tx[(tx_head + tx_count) % TX_COUNT];
-  memcpy(r.bytes, text, length); r.size = length; r.offset = 0; ++tx_count;
+  memcpy(r.bytes, text, length);
+  r.size = length;
+  r.offset = 0;
+  ++tx_count;
   return true;
 }
 static bool enqueueFormat(bool control, const char *format, ...) {
-  va_list args; va_start(args, format);
-  const int n = vsnprintf(format_buffer, TX_SIZE, format, args); va_end(args);
+  va_list args;
+  va_start(args, format);
+  const int n = vsnprintf(format_buffer, TX_SIZE, format, args);
+  va_end(args);
   if (n < 0 || n >= (int)TX_SIZE) return false;
   return enqueueText(format_buffer, control);
 }
@@ -728,9 +681,11 @@ static void serviceTx() {
   // No flush, retry, or Serial boolean conversion (which calls tud_task).
   const size_t sent = Serial.write((const uint8_t *)r.bytes + r.offset, n);
   r.offset += sent;
-  if (r.offset == r.size) { tx_head = (tx_head + 1) % TX_COUNT; --tx_count; }
+  if (r.offset == r.size) {
+    tx_head = (tx_head + 1) % TX_COUNT;
+    --tx_count;
+  }
 }
-
 static uint32_t seq = 0, scan_id = 0, cycle_id = 0, missed_slots_total = 0;
 static uint32_t slot_us = 0, phase_update_us = 0;
 static bool monitor_enabled = true;
@@ -738,6 +693,16 @@ static const uint32_t HOST_HEARTBEAT_TIMEOUT_MS = 3000;
 static bool host_watchdog_armed = false, host_seen = false;
 static uint32_t last_host_heartbeat_ms = 0;
 static char run_id[17] = "", ended_id[17] = "", run_mode[5] = "";
+// Completed IDs are never evicted: after 64 owned runs reject new STARTs
+// until a deliberate board reset. Correlation IDs are not authentication.
+static const uint8_t COMPLETED_CAPACITY = 64;
+static char completed_ids[COMPLETED_CAPACITY][17];
+static uint8_t completed_count = 0;
+static bool completedId(const char *id) {
+  for (uint8_t i = 0; i < completed_count; ++i)
+    if (!strcmp(id, completed_ids[i])) return true;
+  return false;
+}
 static char ended_marker[128] = "", started_marker[128] = "";
 static int64_t final_enqueued_seq = -1;
 static bool scan_active = false;
@@ -747,21 +712,32 @@ static int scan_phase = -1, scan_preset = -1, scan_dac = 0;
 static uint32_t scan_cycle = 0;
 static float scan_target = 0, scan_peak = 0, scan_feedback = 0;
 static void closeScan();
-
 static void startMotion(int preset) {
-  current_preset = preset; phi_us = 0; seq = scan_id = cycle_id = missed_slots_total = 0;
-  actuator_clamped = false; scan_active = false; final_enqueued_seq = -1;
+  current_preset = preset;
+  phi_us = 0;
+  seq = scan_id = cycle_id = missed_slots_total = 0;
+  actuator_clamped = false;
+  scan_active = false;
+  final_enqueued_seq = -1;
   tx_dropped_total = 0;
   slot_us = phase_update_us = last_dac_us = micros();
-  resetPositionFeedback(); last_feedback_dac = readPotAsDacEquivalent();
-  host_watchdog_armed = run_id[0] || (host_seen &&
-      (uint32_t)(millis() - last_host_heartbeat_ms) < HOST_HEARTBEAT_TIMEOUT_MS);
+  resetPositionFeedback();
+  last_feedback_dac = readPotAsDacEquivalent();
+  host_watchdog_armed = run_id[0] || (host_seen && (uint32_t)(millis() - last_host_heartbeat_ms) <
+                                                       HOST_HEARTBEAT_TIMEOUT_MS);
 }
-static void startPreset(int idx) { startMotion(constrain(idx, 0, 3)); }
-static void startDemoSine() { startMotion(-2); }
+static void startPreset(int idx) {
+  startMotion(constrain(idx, 0, 3));
+}
+static void startDemoSine() {
+  startMotion(-2);
+}
 static void goIdleHold() {
-  current_preset = -1; host_watchdog_armed = false; scan_active = false;
-  resetPositionFeedback(); holdCentre();
+  current_preset = -1;
+  host_watchdog_armed = false;
+  scan_active = false;
+  resetPositionFeedback();
+  holdCentre();
 }
 static void endSession(const char *reason) {
   // Hold first; unclosed acquisition is deliberately abandoned. ENDED is a
@@ -769,9 +745,11 @@ static void endSession(const char *reason) {
   goIdleHold();
   if (!run_id[0]) return;
   strcpy(ended_id, run_id);
-  snprintf(ended_marker, sizeof ended_marker, "# ENDED,2,%s,%ld,%s,%lu\n",
-           run_id, (long)final_enqueued_seq, reason, (unsigned long)tx_dropped_total);
-  enqueueText(ended_marker, true); run_id[0] = 0;
+  if (completed_count < COMPLETED_CAPACITY) strcpy(completed_ids[completed_count++], run_id);
+  snprintf(ended_marker, sizeof ended_marker, "# ENDED,2,%s,%lld,%s,%lu\n", run_id,
+           (long long)final_enqueued_seq, reason, (unsigned long)tx_dropped_total);
+  enqueueText(ended_marker, true);
+  run_id[0] = 0;
 }
 static bool validId(const char *id) {
   if (strlen(id) != 16) return false;
@@ -780,34 +758,47 @@ static bool validId(const char *id) {
   return true;
 }
 static void handleFrame(char *line) {
-  char *first = strchr(line, ','); if (!first) return; *first++ = 0;
-  char *mode = strchr(first, ','); if (mode) *mode++ = 0;
+  char *first = strchr(line, ',');
+  if (!first) return;
+  *first++ = 0;
+  char *mode = strchr(first, ',');
+  if (mode) *mode++ = 0;
   if (!validId(first)) return;
   if (!strcmp(line, "@PING") && !mode) {
     if (run_id[0] && !strcmp(run_id, first)) last_host_heartbeat_ms = millis();
   } else if (!strcmp(line, "@STOP") && !mode) {
-    if (run_id[0] && !strcmp(run_id, first)) endSession("host_stop");
-    else if (!strcmp(ended_id, first) && tx_count < TX_COUNT - 1) enqueueText(ended_marker, true);
+    if (run_id[0] && !strcmp(run_id, first))
+      endSession("host_stop");
+    else if (!strcmp(ended_id, first) && tx_count < TX_COUNT - 1)
+      enqueueText(ended_marker, true);
   } else if (!strcmp(line, "@START") && mode) {
-    const int preset = !strcmp(mode, "DEMO") ? -2 :
-      (strlen(mode) == 2 && mode[0] == 'P' && mode[1] >= '0' && mode[1] <= '3' ? mode[1]-'0' : -1);
-    if (preset == -1 || !strcmp(first, ended_id)) return;
+    const int preset = !strcmp(mode, "DEMO") ? -2
+                                             : (strlen(mode) == 2 && mode[0] == 'P' &&
+                                                        mode[1] >= '0' && mode[1] <= '3'
+                                                    ? mode[1] - '0'
+                                                    : -1);
+    if (preset == -1 || completedId(first)) return;
     if (run_id[0]) {
       if (!strcmp(run_id, first) && !strcmp(run_mode, mode) && tx_count < TX_COUNT - 1)
         enqueueText(started_marker, true);
       return;
     }
+    if (completed_count == COMPLETED_CAPACITY) {
+      enqueueText("# ERROR,2,completed_id_capacity_reset_required\n");
+      return;
+    }
     // Reserve STARTED plus a future ENDED before any motion.
     if (tx_count > TX_COUNT - 2) return;
-    snprintf(started_marker, sizeof started_marker, "# STARTED,2,%s,%s,%lu,%lu\n",
-             first, mode, (unsigned long)millis(), (unsigned long)micros());
+    snprintf(started_marker, sizeof started_marker, "# STARTED,2,%s,%s,%lu,%lu\n", first, mode,
+             (unsigned long)millis(), (unsigned long)micros());
     if (!enqueueText(started_marker, true)) return;
-    strcpy(run_id, first); strcpy(run_mode, mode);
-    host_seen = true; last_host_heartbeat_ms = millis();
+    strcpy(run_id, first);
+    strcpy(run_mode, mode);
+    host_seen = true;
+    last_host_heartbeat_ms = millis();
     startMotion(preset);
   }
 }
-
 #ifndef MECH_BUILD_ID
 #define MECH_BUILD_ID "unknown"
 #endif
@@ -819,93 +810,179 @@ static bool serviceMeta() {
   if (meta_step < 0 || tx_count >= TX_COUNT - 2) return false;
   bool ok = false;
   switch (meta_step) {
-    case 0: ok=enqueueText("# PROTOCOL,2\n"); break;
-    case 1: ok=enqueueFormat(false,"# META_BEGIN,2,%s\n",MECH_BUILD_ID); break;
-    case 2: ok=enqueueText("# META,2,core,renesas_uno_1.6.0\n"); break;
-    case 3: ok=enqueueFormat(false,"# META,2,tidal_ml,%.8g\n",V_TIDAL_ML); break;
-    case 4: ok=enqueueFormat(false,"# META,2,bore_mm,%.8g\n",CYLINDER_DIAMETER_MM); break;
-    case 5: ok=enqueueFormat(false,"# META,2,stroke_mm,%.8g\n",ACTUATOR_STROKE_MM); break;
-    case 6: ok=enqueueFormat(false,"# META,2,dac_centre,%d\n",DAC_CENTRE); break;
-    case 7: ok=enqueueFormat(false,"# META,2,dac_half_range,%d\n",DAC_HALF_RANGE); break;
-    case 8: ok=enqueueFormat(false,"# META,2,dac_corr_offset,%.8g\n",DAC_CORR_OFFSET); break;
-    case 9: ok=enqueueFormat(false,"# META,2,dac_corr_gain,%.8g\n",DAC_CORR_GAIN); break;
-    case 10: ok=enqueueFormat(false,"# META,2,pot_raw_centre,%.8g\n",POT_RAW_AT_CENTRE); break;
-    case 11: ok=enqueueFormat(false,"# META,2,pot_dac_per_adc,%.8g\n",POT_DAC_COUNTS_PER_ADC); break;
-    case 12: ok=enqueueFormat(false,"# META,2,calibration_target,%d\n",CALIBRATION_TARGET_JRK_SCALE); break;
-    case 13: ok=enqueueFormat(false,"# META,2,slot_us,%lu\n",(unsigned long)LOG_INTERVAL_US); break;
-    case 14: ok=enqueueFormat(false,"# META,2,sfm_scale,%.8g\n",SFM3000_SCALE_FLOW_AIR); break;
-    case 15: ok=enqueueText("# META,2,flow_reference,local_target_standard_293.15K_1013mbar_airN2\n"); break;
-    case 16: ok=enqueueFormat(false,"# META_END,2,%s\n",MECH_BUILD_ID); break;
-    default: ok=enqueueText("# READY_QUERY\n"); if(ok) meta_step=-2;
+    case 0:
+      ok = enqueueText("# PROTOCOL,2\n");
+      break;
+    case 1:
+      ok = enqueueFormat(false, "# META_BEGIN,2,%s\n", MECH_BUILD_ID);
+      break;
+    case 2:
+      ok = enqueueText("# META,2,core,renesas_uno_1.6.0\n");
+      break;
+    case 3:
+      ok = enqueueFormat(false, "# META,2,tidal_ml,%.8g\n", V_TIDAL_ML);
+      break;
+    case 4:
+      ok = enqueueFormat(false, "# META,2,bore_mm,%.8g\n", CYLINDER_DIAMETER_MM);
+      break;
+    case 5:
+      ok = enqueueFormat(false, "# META,2,stroke_mm,%.8g\n", ACTUATOR_STROKE_MM);
+      break;
+    case 6:
+      ok = enqueueFormat(false, "# META,2,dac_centre,%d\n", DAC_CENTRE);
+      break;
+    case 7:
+      ok = enqueueFormat(false, "# META,2,dac_half_range,%d\n", DAC_HALF_RANGE);
+      break;
+    case 8:
+      ok = enqueueFormat(false, "# META,2,dac_corr_offset,%.8g\n", DAC_CORR_OFFSET);
+      break;
+    case 9:
+      ok = enqueueFormat(false, "# META,2,dac_corr_gain,%.8g\n", DAC_CORR_GAIN);
+      break;
+    case 10:
+      ok = enqueueFormat(false, "# META,2,pot_raw_centre,%.8g\n", POT_RAW_AT_CENTRE);
+      break;
+    case 11:
+      ok = enqueueFormat(false, "# META,2,pot_dac_per_adc,%.8g\n", POT_DAC_COUNTS_PER_ADC);
+      break;
+    case 12:
+      ok = enqueueFormat(false, "# META,2,calibration_target,%d\n", CALIBRATION_TARGET_JRK_SCALE);
+      break;
+    case 13:
+      ok = enqueueFormat(false, "# META,2,slot_us,%lu\n", (unsigned long)LOG_INTERVAL_US);
+      break;
+    case 14:
+      ok = enqueueFormat(false, "# META,2,sfm_scale,%.8g\n", SFM3000_SCALE_FLOW_AIR);
+      break;
+    case 15:
+      ok = enqueueText("# META,2,flow_reference,local_target_standard_293.15K_1013mbar_airN2\n");
+      break;
+    case 16:
+      ok = enqueueFormat(false, "# META_END,2,%s\n", MECH_BUILD_ID);
+      break;
+    default:
+      ok = enqueueText("# READY_QUERY\n");
+      if (ok) meta_step = -2;
   }
   if (ok) ++meta_step;
   return ok;
 }
-static char rx_frame[64]; static uint8_t rx_length = 0;
+static char rx_frame[64];
+static uint8_t rx_length = 0;
 static bool rx_in_frame = false, rx_discard = false;
 static uint32_t rx_start_ms = 0;
 static void handleSerial() {
-  if (rx_in_frame && (uint32_t)(millis()-rx_start_ms) >= 250) rx_discard = true;
-  for (uint8_t budget=0; budget<32 && Serial.available(); ++budget) {
+  if (rx_in_frame && (uint32_t)(millis() - rx_start_ms) >= 250) rx_discard = true;
+  for (uint8_t budget = 0; budget < 32 && Serial.available(); ++budget) {
     const char c = Serial.read();
     if (rx_in_frame) {
       if (c == '\n') {
-        if (!rx_discard) { rx_frame[rx_length]=0; handleFrame(rx_frame); }
-        rx_in_frame = rx_discard = false; rx_length = 0;
+        if (!rx_discard) {
+          rx_frame[rx_length] = 0;
+          handleFrame(rx_frame);
+        }
+        rx_in_frame = rx_discard = false;
+        rx_length = 0;
       } else if (!rx_discard) {
-        if (rx_length >= sizeof(rx_frame)-1 || c < 32 || c > 126) rx_discard=true;
-        else rx_frame[rx_length++]=c;
+        if (rx_length >= sizeof(rx_frame) - 1 || c < 32 || c > 126)
+          rx_discard = true;
+        else
+          rx_frame[rx_length++] = c;
       }
       continue;
     }
-    if (c=='@') { rx_in_frame=true; rx_length=0; rx_frame[rx_length++]=c; rx_start_ms=millis(); continue; }
-    if (c=='?') { if (!run_id[0]) meta_step=0; continue; }
-    if (c=='!') { if (!run_id[0]) {host_seen=true;last_host_heartbeat_ms=millis();host_watchdog_armed=true;} continue; }
-    if (c=='m'||c=='M') {monitor_enabled=!monitor_enabled;continue;}
-    if ((c>='1' && c<='4') || c=='s'||c=='S'||c=='H'||c=='h'||c=='0'||c=='X'||c=='x') {
+    if (c == '@') {
+      rx_in_frame = true;
+      rx_length = 0;
+      rx_frame[rx_length++] = c;
+      rx_start_ms = millis();
+      continue;
+    }
+    if (c == '?') {
+      if (!run_id[0]) meta_step = 0;
+      continue;
+    }
+    if (c == '!') {
+      if (!run_id[0]) {
+        host_seen = true;
+        last_host_heartbeat_ms = millis();
+        host_watchdog_armed = true;
+      }
+      continue;
+    }
+    if (c == 'm' || c == 'M') {
+      monitor_enabled = !monitor_enabled;
+      continue;
+    }
+    if ((c >= '1' && c <= '4') || c == 's' || c == 'S' || c == 'H' || c == 'h' || c == '0' ||
+        c == 'X' || c == 'x') {
       if (run_id[0]) endSession("manual_override");
-      if (c>='1' && c<='4') startPreset(c-'1');
-      else if (c=='s'||c=='S') startDemoSine();
-      else {goIdleHold(); if(c=='X'||c=='x') writeActuatorDac(applyDacCorrection(CALIBRATION_TARGET_JRK_SCALE));}
+      if (c >= '1' && c <= '4')
+        startPreset(c - '1');
+      else if (c == 's' || c == 'S')
+        startDemoSine();
+      else {
+        goIdleHold();
+        if (c == 'X' || c == 'x')
+          writeActuatorDac(applyDacCorrection(CALIBRATION_TARGET_JRK_SCALE));
+      }
     }
   }
 }
-
 // Each pass is SELECT or a single sensor READ/STOP/START. A slot timeout
 // abandons the old scan; rotation prevents later mux channels starving.
 static void serviceSensors() {
   if (!scan_active) return;
-  if (sensor_step==0) { sfm3000Service(micros()); sensor_step=1; return; }
-  SdpSensor &s=psens[scan_ch];
-  if (sensor_step==1) {
-    if (s.recovery_state!=SDP_RECOVERY_IDLE && !timeReachedUs(micros(),s.recovery_due_us)) {
-      sensor_step=3;
-    } else if (!muxSelect(scan_ch)) {
-      if (++s.consecutive_fails >= CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
-        s.consecutive_fails=0; s.recovery_state=SDP_RECOVERY_RETRY_WAIT; s.recovery_due_us=micros()+SDP_RECOVERY_RETRY_US;
-      }
-      sensor_step=3;
-    } else sensor_step=2;
+  if (sensor_step == 0) {
+    sfm3000Service(micros());
+    sensor_step = 1;
     return;
   }
-  if (sensor_step==2) {
-    if (s.recovery_state==SDP_RECOVERY_RETRY_WAIT) {
-      sdpStop(); ++s.reinit_count; s.recovery_state=SDP_RECOVERY_WAIT_START; s.recovery_due_us=micros()+1000;
-    } else if (s.recovery_state==SDP_RECOVERY_WAIT_START) {
-      const bool started=sdpStart(); s.recovery_state=started?SDP_RECOVERY_WAIT_READY:SDP_RECOVERY_RETRY_WAIT;
-      s.recovery_due_us=micros()+(started?25000:SDP_RECOVERY_RETRY_US);
+  SdpSensor &s = psens[scan_ch];
+  if (sensor_step == 1) {
+    if (s.recovery_state != SDP_RECOVERY_IDLE && !timeReachedUs(micros(), s.recovery_due_us)) {
+      sensor_step = 3;
+    } else if (!muxSelect(scan_ch)) {
+      if (++s.consecutive_fails >= CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
+        s.consecutive_fails = 0;
+        s.recovery_state = SDP_RECOVERY_RETRY_WAIT;
+        s.recovery_due_us = micros() + SDP_RECOVERY_RETRY_US;
+      }
+      sensor_step = 3;
+    } else
+      sensor_step = 2;
+    return;
+  }
+  if (sensor_step == 2) {
+    if (s.recovery_state == SDP_RECOVERY_RETRY_WAIT) {
+      sdpStop();
+      ++s.reinit_count;
+      s.recovery_state = SDP_RECOVERY_WAIT_START;
+      s.recovery_due_us = micros() + 1000;
+    } else if (s.recovery_state == SDP_RECOVERY_WAIT_START) {
+      const bool started = sdpStart();
+      s.recovery_state = started ? SDP_RECOVERY_WAIT_READY : SDP_RECOVERY_RETRY_WAIT;
+      s.recovery_due_us = micros() + (started ? 25000 : SDP_RECOVERY_RETRY_US);
     } else {
-      s.recovery_state=SDP_RECOVERY_IDLE;
-      s.ok=sdpRead(s.pressure_pa,s.temp_c);
-      if(s.ok) {s.sample_us=micros();s.consecutive_fails=0;}
-      else if(++s.consecutive_fails>=CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
-        s.consecutive_fails=0;s.recovery_state=SDP_RECOVERY_RETRY_WAIT;s.recovery_due_us=micros();
+      s.recovery_state = SDP_RECOVERY_IDLE;
+      s.ok = sdpRead(s.pressure_pa, s.temp_c);
+      if (s.ok) {
+        s.sample_us = micros();
+        s.consecutive_fails = 0;
+      } else if (++s.consecutive_fails >= CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
+        s.consecutive_fails = 0;
+        s.recovery_state = SDP_RECOVERY_RETRY_WAIT;
+        s.recovery_due_us = micros();
       }
     }
-    sensor_step=3; return;
+    sensor_step = 3;
+    return;
   }
-  ++scan_done; scan_ch=(scan_ch+1)%NUM_PSENS; sensor_step=1;
-  if(scan_done==NUM_PSENS) closeScan();
+  ++scan_done;
+  scan_ch = (scan_ch + 1) % NUM_PSENS;
+  sensor_step = 1;
+  if (scan_done == NUM_PSENS) closeScan();
 }
 // Check each append before advancing the cursor; truncated snprintf lengths
 // must never become out-of-bounds pointer arithmetic on the next append.
@@ -937,26 +1014,27 @@ static void closeScan() {
   }
   size_t used = 0;
   bool fits = appendField(used, "%s,%lu,%lu,%.3f,%d,%ld,", run_id[0] ? "DATA2" : "DATA",
-      (unsigned long)seq, (unsigned long)millis(), flow_slm, flow_sensor_ok,
-      (long)sampleAgeUs(row_us, flow_sensor_ok, flow_sample_us));
+                          (unsigned long)seq, (unsigned long)millis(), flow_slm, flow_sensor_ok,
+                          (long)sampleAgeUs(row_us, flow_sensor_ok, flow_sample_us));
   int ok_count = 0;
   for (uint8_t ch = 0; ch < NUM_PSENS; ++ch) {
     fits = fits && appendField(used, "%.3f,", psens[ch].pressure_pa);
     ok_count += psens[ch].ok;
   }
   fits = fits && appendField(used, "%.2f,", averagePsensTemp(ok_count));
+  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch) fits = fits && appendField(used, "%d,", psens[ch].ok);
   for (uint8_t ch = 0; ch < NUM_PSENS; ++ch)
-    fits = fits && appendField(used, "%d,", psens[ch].ok);
-  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch)
-    fits = fits && appendField(used, "%ld,", (long)sampleAgeUs(row_us, psens[ch].ok, psens[ch].sample_us));
-  fits = fits && appendField(used, "%d,%.2f,%.2f,%.2f,%.3f,%.3f,%d,%d,%d",
-      scan_dac, scan_feedback, 100.0f * (scan_dac - corrected_centre_dac) / DAC_HALF_RANGE,
-      100.0f * (scan_feedback - corrected_centre_dac) / DAC_HALF_RANGE,
-      scan_target, scan_peak, scan_phase, scan_preset, actuator_clamped);
+    fits = fits &&
+           appendField(used, "%ld,", (long)sampleAgeUs(row_us, psens[ch].ok, psens[ch].sample_us));
+  fits = fits && appendField(used, "%d,%.2f,%.2f,%.2f,%.3f,%.3f,%d,%d,%d", scan_dac, scan_feedback,
+                             100.0f * (scan_dac - corrected_centre_dac) / DAC_HALF_RANGE,
+                             100.0f * (scan_feedback - corrected_centre_dac) / DAC_HALF_RANGE,
+                             scan_target, scan_peak, scan_phase, scan_preset, actuator_clamped);
   if (run_id[0])
-    fits = fits && appendField(used, ",%s,%lu,%lu,%lu,%lu,%lu,%lu", run_id,
-        (unsigned long)scan_id, (unsigned long)row_us, (unsigned long)scan_cycle,
-        (unsigned long)scan_start_us, (unsigned long)missed_slots_total, (unsigned long)tx_dropped_total);
+    fits = fits && appendField(used, ",%s,%lu,%lu,%lu,%lu,%lu,%lu", run_id, (unsigned long)scan_id,
+                               (unsigned long)row_us, (unsigned long)scan_cycle,
+                               (unsigned long)scan_start_us, (unsigned long)missed_slots_total,
+                               (unsigned long)tx_dropped_total);
   fits = fits && appendField(used, "\n");
   if (fits) {
     if (enqueueText(format_buffer, false, true)) final_enqueued_seq = seq;
@@ -966,46 +1044,77 @@ static void closeScan() {
   ++seq;
 }
 static void startScan(uint32_t now) {
-  scan_active=true; ++scan_id; scan_start_us=now; scan_done=0; sensor_step=0;
-  scan_ch=rotation; rotation=(rotation+1)%NUM_PSENS;
-  flow_sensor_ok=false; for(auto &s:psens) s.ok=false;
-  scan_cycle=cycle_id;scan_preset=current_preset;scan_dac=last_dac_out;scan_feedback=last_feedback_dac;
-  scan_target=commandedFlowSlm(phi_us,scan_phase,scan_peak);
+  scan_active = true;
+  ++scan_id;
+  scan_start_us = now;
+  scan_done = 0;
+  sensor_step = 0;
+  scan_ch = rotation;
+  rotation = (rotation + 1) % NUM_PSENS;
+  flow_sensor_ok = false;
+  for (auto &s : psens) s.ok = false;
+  scan_cycle = cycle_id;
+  scan_preset = current_preset;
+  scan_dac = last_dac_out;
+  scan_feedback = last_feedback_dac;
+  scan_target = commandedFlowSlm(phi_us, scan_phase, scan_peak);
 }
 void setup() {
   // Centre precedes USB diagnostics and all I2C initialization.
-  initPresets();corrected_centre_dac=applyDacCorrection(DAC_CENTRE);
-  demo_sine_dac_min=DAC_REG_MIN+DEMO_SINE_MARGIN_DAC;demo_sine_dac_max=DAC_REG_MAX-DEMO_SINE_MARGIN_DAC;
-  analogWriteResolution(12);analogReadResolution(12);holdCentre();
-  Serial.begin(115200);delay(2000);
-  i2cBusRecovery();Wire.begin();Wire.setClock(200000);Wire.setWireTimeout(I2C_TRANSACTION_TIMEOUT_US,false);
-  i2cBusRecovery1();Wire1.begin();Wire1.setClock(400000);Wire1.setWireTimeout(I2C_TRANSACTION_TIMEOUT_US,false);
-  sfm_ok=sfm3000Init();sfm_recovery_due_us=micros()+SFM_RETRY_INTERVAL_US;
-  for(uint8_t ch=0;ch<NUM_PSENS;++ch) {
-    if(!initPsensChannel(ch)) psens[ch].recovery_state=SDP_RECOVERY_RETRY_WAIT;
+  initPresets();
+  corrected_centre_dac = applyDacCorrection(DAC_CENTRE);
+  demo_sine_dac_min = DAC_REG_MIN + DEMO_SINE_MARGIN_DAC;
+  demo_sine_dac_max = DAC_REG_MAX - DEMO_SINE_MARGIN_DAC;
+  analogWriteResolution(12);
+  analogReadResolution(12);
+  holdCentre();
+  Serial.begin(115200);
+  delay(2000);
+  i2cBusRecovery();
+  Wire.begin();
+  Wire.setClock(200000);
+  Wire.setWireTimeout(I2C_TRANSACTION_TIMEOUT_US, false);
+  i2cBusRecovery1();
+  Wire1.begin();
+  Wire1.setClock(400000);
+  Wire1.setWireTimeout(I2C_TRANSACTION_TIMEOUT_US, false);
+  sfm_ok = sfm3000Init();
+  sfm_recovery_due_us = micros() + SFM_RETRY_INTERVAL_US;
+  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch) {
+    if (!initPsensChannel(ch)) psens[ch].recovery_state = SDP_RECOVERY_RETRY_WAIT;
     delay(25);
   }
-  slot_us=phase_update_us=last_dac_us=micros();
+  slot_us = phase_update_us = last_dac_us = micros();
   enqueueText("# BOOT,2\n");
-  enqueueFormat(false, "# INIT,flow_ok=%d,geometry_ml=%.1f,dac_centre=%d\n", sfm_ok, V_TIDAL_ML, corrected_centre_dac);
+  enqueueFormat(false, "# INIT,flow_ok=%d,geometry_ml=%.1f,dac_centre=%d\n", sfm_ok, V_TIDAL_ML,
+                corrected_centre_dac);
 }
 void loop() {
-  if(host_watchdog_armed && (uint32_t)(millis()-last_host_heartbeat_ms)>=HOST_HEARTBEAT_TIMEOUT_MS)
+  if (host_watchdog_armed &&
+      (uint32_t)(millis() - last_host_heartbeat_ms) >= HOST_HEARTBEAT_TIMEOUT_MS)
     endSession("watchdog");
-  const uint32_t now=micros();
-  const uint32_t elapsed=now-slot_us;
-  if(elapsed>=LOG_INTERVAL_US) {
-    const uint32_t slots=elapsed/LOG_INTERVAL_US;slot_us+=slots*LOG_INTERVAL_US;missed_slots_total+=slots-1;
-    if(scan_active) closeScan();
-    if(current_preset!=-1) {
-      const float period=current_preset==-2?DEMO_SINE_PERIOD_US:presets[current_preset].period_us;
-      const float total=phi_us+(float)(uint32_t)(now-phase_update_us);
-      cycle_id+=(uint32_t)(total/period);phi_us=fmodf(total,period);
-      if(current_preset==-2) stepDemoSine(phi_us); else stepDac(phi_us);
+  const uint32_t now = micros();
+  const uint32_t elapsed = now - slot_us;
+  if (elapsed >= LOG_INTERVAL_US) {
+    const uint32_t slots = elapsed / LOG_INTERVAL_US;
+    slot_us += slots * LOG_INTERVAL_US;
+    missed_slots_total += slots - 1;
+    if (scan_active) closeScan();
+    if (current_preset != -1) {
+      const float period =
+          current_preset == -2 ? DEMO_SINE_PERIOD_US : presets[current_preset].period_us;
+      const float total = phi_us + (float)(uint32_t)(now - phase_update_us);
+      cycle_id += (uint32_t)(total / period);
+      phi_us = fmodf(total, period);
+      if (current_preset == -2)
+        stepDemoSine(phi_us);
+      else
+        stepDac(phi_us);
     }
-    phase_update_us=last_dac_us=now;
-    last_feedback_dac=readPotAsDacEquivalent();position_follow_error=last_dac_out-last_feedback_dac;
-    if(current_preset!=-1) startScan(now);
+    phase_update_us = last_dac_us = now;
+    last_feedback_dac = readPotAsDacEquivalent();
+    position_follow_error = last_dac_out - last_feedback_dac;
+    if (current_preset != -1) startScan(now);
   }
   handleSerial();
   serviceTx();
@@ -1019,8 +1128,12 @@ void loop() {
       pressure_ok_count += sensor.ok;
       pressure_reinits += sensor.reinit_count;
     }
-    enqueueFormat(false, "# MONITOR,preset=%d,flow_ok=%d,pressure_ok=%d,flow_reinits=%lu,pressure_reinits=%lu,clamped=%d\n",
-        current_preset, flow_sensor_ok, pressure_ok_count, (unsigned long)sfm_reinit_count,
-        (unsigned long)pressure_reinits, actuator_clamped);
+    enqueueFormat(false,
+                  "# "
+                  "MONITOR,preset=%d,flow_ok=%d,pressure_ok=%d,flow_reinits=%lu,pressure_reinits=%"
+                  "lu,clamped=%d\n",
+                  current_preset, flow_sensor_ok, pressure_ok_count,
+                  (unsigned long)sfm_reinit_count, (unsigned long)pressure_reinits,
+                  actuator_clamped);
   }
 }

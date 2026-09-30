@@ -56,3 +56,10 @@ class Policy(unittest.TestCase):
         self.assertIsNone(ev[0]['qualified_peak'])
         d,ev=detect([10]*10,cfg,lambda s:s._replace(target_reference_resolved=False))
         self.assertIsNone(ev[0]['target_met']);self.assertEqual(d.target_misses,0)
+    def test_plateau_failure_counts_outside_peak(self):
+        cfg=PeakDetectionConfig(smooth_window=1,min_samples=5)
+        d,ev=detect([10]*10,cfg,lambda s:s._replace(pok=[s.seq!=3]*7))
+        self.assertTrue(ev[0]['peak_sample_ok']);self.assertFalse(ev[0]['qualified_peak'])
+        self.assertEqual(d.pressure_incomplete,1)
+        d,ev=detect([10]*10,cfg,lambda s:s._replace(pa_age_us=[30000 if s.seq==3 else 100]*7))
+        self.assertEqual(d.timing_failures,1)

@@ -52,7 +52,7 @@ struct FakeSerial {
 } Serial;
 uint8_t crc(uint16_t w){uint8_t v=0xff;for(auto b:{uint8_t(w>>8),uint8_t(w)}){v^=b;for(int j=0;j<8;j++)v=v&128?(v<<1)^0x31:v<<1;}return v;}
 struct FakeWire {
- bool pressure=false, fail=false, corrupt=false, short_read=false; int scans=0, requested=0, address=0, payload=0; std::deque<uint8_t> rx;
+ bool pressure=false, fail=false, corrupt=false, short_read=false; int scans=0, requested=0, address=0, payload=0; uint16_t flow_word=33400; std::deque<uint8_t> rx;
  void begin(){} void setClock(int){} void setWireTimeout(uint32_t,bool){}
  void beginTransmission(int a){address=a;} void write(int v){payload=v;}
  int endTransmission(){
@@ -64,7 +64,7 @@ struct FakeWire {
    return fail?4:0;
  }
  int requestFrom(int a,int n){transactions.push_back({micros(),pressure?1:0,a,selected_channel,true});requested=n;scans++;fake_us+=fail?5000:200;if(fail || short_read)return 0;rx.clear();
-   if(!pressure){rx={0x82,0x78,0}; uint8_t v=0; for(uint8_t b:{uint8_t(0x82),uint8_t(0x78)}){v^=b;for(int j=0;j<8;j++)v=v&128?(v<<1)^0x31:v<<1;}rx[2]=corrupt?v^1:v;return n;} // 33400 => 10 slm
-   for(uint16_t w:{uint16_t(1200),uint16_t(5000),uint16_t(60)}){rx.push_back(w>>8);rx.push_back(w);rx.push_back(crc(w));}return n;}
+   if(!pressure){rx={uint8_t(flow_word>>8),uint8_t(flow_word),0}; uint8_t v=0; for(uint8_t b:{uint8_t(flow_word>>8),uint8_t(flow_word)}){v^=b;for(int j=0;j<8;j++)v=v&128?(v<<1)^0x31:v<<1;}rx[2]=corrupt?v^1:v;return n;} // 33400 => 10 slm
+   for(uint16_t w:{uint16_t(1200+selected_channel*60),uint16_t(5000),uint16_t(60)}){rx.push_back(w>>8);rx.push_back(w);rx.push_back(crc(w));}return n;}
  int available(){return rx.size();} int read(){int x=rx.front();rx.pop_front();return x;}
 } Wire,Wire1;

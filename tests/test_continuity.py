@@ -35,3 +35,13 @@ class Continuity(unittest.TestCase):
             s._handle_data_line(wire(2,0));self.assertEqual(s._last_sample.flow_avg,0)
             self.assertEqual(s._run_bad_lines,1)
             s._fault('test_end')
+    def test_seq_wrap_repeated_scan_and_reset(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=link();recording(s,d)
+            p=wire(0).split(',');p[1]='4294967295';s._handle_data_line(','.join(p))
+            p=wire(1).split(',');p[1]='0';s._handle_data_line(','.join(p))
+            self.assertEqual(s._run_dropped_rows,0)
+            p=wire(2).split(',');p[1]='1';p[38]='2';s._handle_data_line(','.join(p))
+            self.assertEqual(s._last_sample.discontinuity_reason,'scan_discontinuity')
+            p=wire(3).split(',');p[2]='1';s._handle_data_line(','.join(p))
+            self.assertEqual(s.state,'FAULTED')

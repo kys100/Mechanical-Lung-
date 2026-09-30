@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "overall_status": "blocked",
+  "reason": "No physical rig available in implementation sandbox",
+  "deployed_build_id": null,
+  "deployed_core": null,
+  "checks": [
+    {"id": "usb_backpressure_disconnect", "status": "blocked", "evidence_paths": [], "instruments": []},
+    {"id": "watchdog_restart_host_loss", "status": "blocked", "evidence_paths": [], "instruments": []},
+    {"id": "sensor_mux_recovery_timing", "status": "blocked", "evidence_paths": [], "instruments": []},
+    {"id": "dac_watchdog_latency", "status": "blocked", "evidence_paths": [], "instruments": []},
+    {"id": "position_geometry_calibration", "status": "blocked", "evidence_paths": [], "instruments": []},
+    {"id": "flow_reference_qualification_yield", "status": "blocked", "evidence_paths": [], "instruments": []}
+  ]
+}

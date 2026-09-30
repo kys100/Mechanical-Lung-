@@ -66,6 +66,20 @@ def replay(session, samples, compare_peaks):
                 'flow_reference', 'boundaries', 'software_hashes', 'firmware', 'expected_expiration_sign')
     if any(key not in manifest for key in required) or not manifest['start_ack'] or not manifest['firmware']:
         raise ValueError('missing replay provenance')
+    if set(manifest['detector_config']) != set(logger.asdict(logger.PeakDetectionConfig())):
+        raise ValueError('incomplete detector configuration')
+    if set(manifest['firmware']) != logger.META_KEYS | {'build_id'}:
+        raise ValueError('incomplete firmware metadata')
+    if set(manifest['flow_reference']) != {'gas_temperature_c', 'absolute_pressure_mbar'}:
+        raise ValueError('incomplete flow reference')
+    if set(manifest['software_hashes']) != {'Data_Logger.txt', 'peak_detection.py'}:
+        raise ValueError('incomplete software hashes')
+    if any(not logger.re.fullmatch('[0-9a-f]{64}', value) for value in manifest['software_hashes'].values()):
+        raise ValueError('invalid software hash')
+    if not isinstance(manifest['avg_window'], int) or isinstance(manifest['avg_window'], bool) or manifest['avg_window'] < 1:
+        raise ValueError('invalid average window')
+    if manifest.get('config_sha256') != logger.config_fingerprint(manifest):
+        raise ValueError('configuration fingerprint mismatch')
     link = logger.SerialLink(None, 115200, manifest['avg_window'],
                              peak_config=logger.PeakDetectionConfig(**manifest['detector_config']),
                              expected_expiration_sign=manifest['expected_expiration_sign'],

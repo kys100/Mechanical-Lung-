@@ -209,6 +209,13 @@ PEAK_COLUMNS = ['peak_idx', 'seq', 'cycle_id', 'phase', 'direction', 'flow_peak_
                 'plateau_span_s', 'excursion_n', 'excursion_s']
 
 
+def config_fingerprint(manifest):
+    fields = {key: manifest[key] for key in ('analysis_policy', 'detector_config',
+              'avg_window', 'expected_expiration_sign', 'flow_reference')}
+    encoded = json.dumps(fields, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(encoded.encode('ascii')).hexdigest()
+
+
 def uint32(value):
     result = int(value)
     if not 0 <= result <= 0xffffffff:
@@ -299,15 +306,11 @@ def open_unique_session(directory, base):
 
 
 class SerialLink:
-    """Owns the serial connection.
+    """Own the serial reader, protocol-2 run lifecycle, plots and recordings.
 
-    A background thread continuously reads lines: "DATA,..." lines are
-    parsed into shared, lock-protected buffers (with a streaming moving
-    average applied to the flow channel as samples arrive); any other line
-    (the sketch's "# ..." banner / human-readable Monitor block) is just
-    echoed to the terminal. The main thread can call send_command() at any
-    time to write a single command byte, same as the sketch's serial
-    protocol expects.
+    The reader incrementally frames bounded ASCII records. Owned motion uses
+    correlated START/PING/STOP frames; legacy data remains display-only.
+    Run state precedes recording state in lock order. ACK waits hold neither.
     """
 
     def __init__(self, port, baud, avg_window, buffer_seconds=180.0,
@@ -457,8 +460,9 @@ class SerialLink:
         self._ready_event.clear()
         self.protocol_version = None
         self.metadata = None
-        if not self.send_command('?'):
-            return False
+        with self._serial_write_lock:
+            if not self._write_bytes_locked(b'\n?'):
+                return False
         return self._ready_event.wait(timeout)
 
     def _reader_loop(self):
@@ -545,7 +549,7 @@ class SerialLink:
             self._meta_pending = None
         elif parts == ['READY_QUERY']:
             # Legacy is display-only. Timed acquisition checks v2 + metadata.
-            if self.protocol_version is None or self.metadata is not None:
+            if (self.protocol_version is None and self.state != 'FAULTED') or self.metadata is not None:
                 self._ready_event.set()
                 with self._run_lock:
                     if self.state == 'FAULTED' and self.metadata is not None:
@@ -610,6 +614,18 @@ class SerialLink:
         self._last_row_us = start_us
         self._elapsed_row_us = 0
         self._segment_id = 0
+        self._phase_first = None
+        self._phase_last = None
+        self._completed_phases = set()
+        with self.lock:
+            for name in ('t', 'flow_raw', 'flow_avg', 'flow_ok', 'flow_age_us',
+                         'psens_temp_avg', 'cmd_dac', 'feedback_dac', 'cmd_pct',
+                         'fdbk_pct', 'target_flow_slm', 'target_peak_slm', 'phase',
+                         'preset', 'clamped'):
+                getattr(self, name).clear()
+            for name in ('psens_pa', 'psens_ok', 'psens_age_us'):
+                for series in getattr(self, name):
+                    series.clear()
 
     def _break_locked(self, reason, before_seq=None):
         self._flow_hist.clear()
@@ -711,11 +727,10 @@ class SerialLink:
         if reason:
             self._break_locked(reason, w['seq'])
         if w['flow_ok']:
-            if len(self._flow_hist) == self.avg_window:
-                self._flow_sum -= self._flow_hist[0]
             self._flow_hist.append(w['flow_raw'])
-            self._flow_sum += w['flow_raw']
-        average = self._flow_sum/len(self._flow_hist) if self._flow_hist else 0.0
+        # Divide before summing so finite extreme inputs cannot poison a
+        # running sum. The bounded window is also replayed with this order.
+        average = sum(value/len(self._flow_hist) for value in self._flow_hist) if self._flow_hist else 0.0
         resolved = standard_flow(w['target_peak_slm'], self.gas_temperature_c, self.absolute_pressure_mbar)
         target = w['target_peak_slm'] if resolved is None else resolved
         sample = Sample(
@@ -731,6 +746,11 @@ class SerialLink:
         self._last_seq = sample.seq
         self._last_sample = sample
         self._last_preset = sample.preset
+        if active and sample.cycle_id is not None and sample.phase in (0, 1):
+            ordinal = sample.cycle_id*2 + sample.phase
+            if self._phase_first is None:
+                self._phase_first = ordinal
+            self._phase_last = ordinal
         return sample
 
     def _plot_sample(self, sample):
@@ -761,6 +781,8 @@ class SerialLink:
     def _write_peak_row(self, event):
         self._peak_writer.writerow(event_record(event))
         self._peak_file.flush()
+        if event['excursion_complete'] and event['sample'].cycle_id is not None:
+            self._completed_phases.add(event['sample'].cycle_id*2+event['sample'].phase)
         if event['excursion_complete'] and self.expected_expiration_sign is not None:
             expected = 1 if self.expected_expiration_sign == 'positive' else -1
             if event['sample'].phase == 1:
@@ -815,6 +837,7 @@ class SerialLink:
                     start_ack=None, end_ack=None, boundaries=[], complete=False,
                     tail_truncated=True, termination_reason='open', rows=0,
                     missing_rows=0, invalid_rows=0)
+                self.manifest['config_sha256'] = config_fingerprint(self.manifest)
                 self._save_manifest()
             except OSError as exc:
                 for stream in (self._record_file, self._peak_file):
@@ -830,6 +853,17 @@ class SerialLink:
             self.orientation_mismatches = 0
             self._detector = PeakFlowDetector(self.peak_config, self._write_peak_row)
             return paths
+
+    def _phase_summary(self):
+        first, last = self._phase_first, self._phase_last
+        if first is None or last is None:
+            return dict(missing_interior=0, first_phase_partial=False, last_phase_partial=False)
+        interior = max(0, last-first-1)
+        completed = sum(first < phase < last for phase in self._completed_phases)
+        return dict(first_ordinal=first, last_ordinal=last,
+                    missing_interior=max(0, interior-completed),
+                    first_phase_partial=first not in self._completed_phases,
+                    last_phase_partial=last not in self._completed_phases)
 
     def _finalize_locked(self, reason, tail_truncated):
         if self._record_file is None:
@@ -868,7 +902,7 @@ class SerialLink:
                              tail_truncated=tail_truncated or failed, termination_reason=reason,
                              rows=self._rows_written, missing_rows=self._run_dropped_rows,
                              invalid_rows=self._run_bad_lines, orientation_mismatches=self.orientation_mismatches,
-                             populations=counters)
+                             populations=counters, commanded_phases=self._phase_summary())
         try:
             self._save_manifest()
         except OSError as exc:
@@ -969,6 +1003,11 @@ class SerialLink:
                 self._heartbeat_enabled = False
             self._cancel_run_timer_locked()
             self.state = 'FAULTED'
+            self.protocol_version = None
+            self.metadata = None
+            self._meta_pending = None
+            self._meta_build = None
+            self._meta_invalid = True
             self._ready_event.clear()
             with self._record_lock:
                 self._finalize_locked(reason, True)
@@ -1246,12 +1285,12 @@ def main():
     fig_act, ax_act = plt.subplots(figsize=(8, 4.5))
     set_title(fig_act, "Actuator command / feedback — live")
     fig_act.suptitle(COMMAND_HELP, fontsize=8)
-    cmd_line, = ax_act.plot([], [], lw=1.5, color="#e07b39", label="commanded")
-    fdbk_line, = ax_act.plot([], [], lw=1.5, color="#2ca02c", label="feedback")
+    cmd_line, = ax_act.plot([], [], lw=1.5, color="#e07b39", label="commanded (normalized DAC)")
+    fdbk_line, = ax_act.plot([], [], lw=1.5, color="#2ca02c", label="feedback (normalized DAC)")
     ax_act.axhline(0, color="#999", lw=0.8)
     ax_act.set_ylim(-115, 115)
     ax_act.set_xlabel("Time (s)")
-    ax_act.set_ylabel("Position (% of stroke)")
+    ax_act.set_ylabel("Position (100 × DAC offset / half-range)")
     ax_act.grid(alpha=0.25)
     ax_act.legend(loc="upper right", fontsize=8)
     act_status = ax_act.text(0.01, 0.97, "", transform=ax_act.transAxes,

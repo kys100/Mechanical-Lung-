@@ -47,3 +47,28 @@ class Provenance(unittest.TestCase):
                 s._handle_marker(f'# ENDED,2,{RID},-1,host_stop,0')
             manifest=json.loads(Path(paths[2]).read_text())
             self.assertFalse(manifest['complete']);self.assertTrue(manifest['tail_truncated'])
+    def test_replay_rejects_missing_configuration_and_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=link();paths=recording(s,d)
+            s._handle_marker(f'# ENDED,2,{RID},-1,host_stop,0')
+            original=json.loads(Path(paths[2]).read_text())
+            args=[sys.executable,str(ROOT/'tools/replay_recording.py'),'--session',paths[2],
+                  '--samples',paths[0],'--compare-peaks',paths[1]]
+            for group,key in [('detector_config','smooth_window'),('firmware','core'),('software_hashes','Data_Logger.txt')]:
+                manifest=json.loads(json.dumps(original));del manifest[group][key]
+                Path(paths[2]).write_text(json.dumps(manifest))
+                result=subprocess.run(args,text=True,capture_output=True)
+                self.assertNotEqual(result.returncode,0,result.stdout)
+                self.assertIn('incomplete',result.stderr)
+            manifest=json.loads(json.dumps(original));manifest['avg_window']=11
+            Path(paths[2]).write_text(json.dumps(manifest))
+            result=subprocess.run(args,text=True,capture_output=True)
+            self.assertNotEqual(result.returncode,0);self.assertIn('fingerprint',result.stderr)
+    def test_initial_manifest_failure_prevents_motion(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=link();from helpers import ready
+            ready(s)
+            with patch.object(logger,'RECORDINGS_DIR',d),patch.object(logger.os,'replace',side_effect=OSError('disk failure')):
+                self.assertFalse(s.begin_timed_run(0,'1'))
+            self.assertEqual(s.state,'IDLE');self.assertFalse(s.ser.writes)
+            self.assertIsNone(s._record_file);self.assertIsNone(s._peak_file)

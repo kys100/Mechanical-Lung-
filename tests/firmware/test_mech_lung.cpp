@@ -4,6 +4,8 @@
 #include <iostream>
 #include <set>
 #include <cfloat>
+static bool synthetic_flow = false;
+static uint64_t synthetic_origin = 0;
 static void initialize() {
   Wire1.pressure = true;
   sfm_ok = true;
@@ -18,6 +20,11 @@ static void frame(const std::string &text) {
 }
 static void tick(uint32_t us = 37) {
   fake_us += us;
+  if (synthetic_flow) {
+    const double seconds = (fake_us-synthetic_origin)/1e6;
+    const double flow = seconds < 2 ? 5*sin(PI*seconds/2) : 0;
+    Wire.flow_word = (uint16_t)(32000+140*flow);
+  }
   const auto before = transactions.size();
   loop();
   assert(transactions.size() - before <= 1);
@@ -51,6 +58,7 @@ int main(int argc, char **argv) {
     assert(std::abs(commandedFlowSlm(p.t_exp_us/2,phase,target)-5)<.001 && phase==0);
     assert(std::abs(commandedFlowSlm(p.t_exp_us+p.t_insp_us/2,phase,target)+10)<.001 && phase==1);
     assert(sdpCheckCrc(0xbe,0xef,0x92));
+    assert(sampleAgeUs(100,true,0)==100);
     assert(timeReachedUs(20,0xfffffff0)); assert(!timeReachedUs(0xfffffff0,20));
     writeActuatorDac(5000); assert(actuator_clamped);
     startPreset(0); assert(!actuator_clamped);
@@ -111,6 +119,7 @@ int main(int argc, char **argv) {
     for(const auto &r:rows) {
       auto f=fields(r); assert(f.size()==44);
       assert(f[4]=="1"); for(int i=14;i<21;i++) assert(f[i]=="1");
+      for(int channel=0;channel<7;channel++) assert(std::stof(f[6+channel])==20+channel);
       assert(f[42]=="0"); assert(scans.insert(std::stoul(f[38])).second);
     }
     for(const auto &t:transactions) if(t.bus==1 && t.read) assert(t.channel>=0 && t.channel<7);
@@ -166,6 +175,35 @@ int main(int argc, char **argv) {
     assert(psens[0].recovery_state==SDP_RECOVERY_WAIT_READY);
     assert(psens[0].recovery_due_us==micros()+25000);
     assert(transactions.back().channel==0);
+  } else if(name=="completed_ids") {
+    frame("@START,0123456789abcdef,P0\n");frame("@STOP,0123456789abcdef\n");runFor(100000);
+    frame("@START,fedcba9876543210,P0\n");frame("@STOP,fedcba9876543210\n");runFor(100000);
+    frame("@START,0123456789abcdef,P0\n");assert(current_preset==-1);
+    for (int i=2;i<COMPLETED_CAPACITY;i++) {
+      char id[17];snprintf(id,sizeof id,"%016x",i);
+      frame(std::string("@START,")+id+",P0\n");assert(current_preset==0);
+      frame(std::string("@STOP,")+id+"\n");runFor(10000);
+    }
+    assert(completed_count==COMPLETED_CAPACITY);
+    frame("@START,ffffffffffffffff,P0\n");assert(current_preset==-1);
+  } else if(name=="emit_session") {
+    frame("?");runFor(100000);
+    frame("@START,0123456789abcdef,P0\n");
+    synthetic_flow=true;synthetic_origin=fake_us;
+    runFor(2500000);
+    frame("@STOP,0123456789abcdef\n");runFor(100000);
+    std::cout << Serial.text;
+    return 0;
+  } else if(name=="final_seq_uint32") {
+    frame("@START,0123456789abcdef,P0\n");
+    final_enqueued_seq=0xffffffffULL;
+    frame("@STOP,0123456789abcdef\n");runFor(100000);
+    assert(Serial.text.find(",4294967295,host_stop,")!=std::string::npos);
+  } else if(name=="query_resync") {
+    frame("@START,0123");fake_us+=300000;handleSerial();
+    frame("\n?");runFor(100000);
+    assert(current_preset==-1);
+    assert(Serial.text.find("# READY_QUERY")!=std::string::npos);
   } else if(name=="metadata") {
     frame("?"); runFor(100000);
     assert(Serial.text.find("# META_BEGIN,2,")!=std::string::npos);
