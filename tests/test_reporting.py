@@ -86,3 +86,70 @@ class Reporting(unittest.TestCase):
                 else:
                     self.assertEqual(s.state,'FAULTED')
                     self.assertEqual(s.manifest['termination_reason'],'transport_fault')
+    def test_gap_callback_fault_classification_and_single_teardown(self):
+        # Exercise the actual callback from an open excursion, through each
+        # caller of break_continuity (including the malformed-line path).
+        import threading
+        for boundary in ('flow', 'sequence', 'malformed'):
+            for category in ('storage_fault', 'format_fault', 'analysis_fault'):
+                with self.subTest(boundary=boundary, category=category), tempfile.TemporaryDirectory() as d:
+                    s=link();recording(s,d);s._heartbeat_enabled=True
+                    for i,flow in enumerate([0]+[10]*12):s._handle_data_line(wire(i,flow))
+                    calls=[]
+                    detector=s._detector
+                    flush_calls=[]
+                    original_flush=detector.flush
+                    def flush():
+                        flush_calls.append(True)
+                        return original_flush()
+                    detector.flush=flush
+                    def fail(*args):
+                        calls.append(True)
+                        if category=='storage_fault':raise OSError('peak disk error')
+                        raise ValueError('peak operation error')
+                    if category=='analysis_fault':detector.break_continuity=fail
+                    else:s._peak_writer.writerow=fail
+                    line={'flow':wire(13,8,flow_ok=0),
+                          'sequence':wire(20,8),
+                          'malformed':'DATA2,malformed'}[boundary]
+                    output,error=io.StringIO(),io.StringIO()
+                    escaped=[]
+                    def process():
+                        try:s._handle_data_line(line)
+                        except BaseException as exc:escaped.append(exc)
+                    # A daemon worker with a bounded join makes accidental
+                    # record/run-lock recursion an explicit test failure.
+                    with contextlib.redirect_stdout(output),contextlib.redirect_stderr(error):
+                        worker=threading.Thread(target=process,daemon=True)
+                        worker.start();worker.join(1)
+                    self.assertFalse(worker.is_alive(),'teardown deadlocked')
+                    self.assertFalse(escaped,repr(escaped))
+                    self.assertEqual(s.state,'FAULTED')
+                    self.assertEqual(s.manifest['termination_reason'],category)
+                    self.assertFalse(s._heartbeat_enabled)
+                    self.assertEqual(len(calls),1)
+                    self.assertFalse(flush_calls,'failed detector was flushed again')
+                    self.assertNotIn('board_time_reset',output.getvalue())
+                    if category!='storage_fault':self.assertIn('Traceback',error.getvalue())
+    def test_firmware_error_visible(self):
+        s=link();output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            s._handle_marker('# ERROR,2,completed_id_capacity_reset_required')
+        self.assertIn('completed_id_capacity_reset_required',output.getvalue())
+    def test_start_ack_manifest_failure_is_storage_fault(self):
+        from helpers import ready, FakeTimer
+        with tempfile.TemporaryDirectory() as d:
+            s=link();ready(s);s.run_id=RID;s.mode='P0';s.state='STARTING'
+            with patch.object(logger,'RECORDINGS_DIR',d):s.start_recording(0)
+            original=s._save_manifest
+            calls=[]
+            def save():
+                calls.append(True)
+                if len(calls)==1:raise OSError('ack manifest storage failure')
+                return original()
+            s._save_manifest=save
+            with patch.object(logger.threading,'Timer',FakeTimer):
+                s._handle_marker(f'# STARTED,2,{RID},P0,1000,1000000')
+            self.assertEqual(s.state,'FAULTED')
+            self.assertEqual(s.manifest['termination_reason'],'storage_fault')
+            self.assertIsNone(s._record_file)

@@ -11,6 +11,7 @@ class FakeSerial:
     def __init__(self, *args, **kwargs):
         self.writes = []
         self.is_open = True
+        self.write_timeout = kwargs.get('write_timeout', 1.0)
     def write(self, data):
         self.writes.append(data)
         return len(data)

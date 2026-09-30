@@ -46,8 +46,10 @@ dac_half_range, dac_corr_offset, dac_corr_gain, pot_raw_centre, pot_dac_per_adc,
 calibration_target, slot_us, sfm_scale, flow_reference. Keys/values are ASCII
 alphanumeric tokens plus `.`, `_`, `+`, `-`; commas/newlines are forbidden.
 Missing/duplicate keys and mismatched build IDs prevent readiness. The build
-script supplies the source SHA256 as MECH_BUILD_ID. Direct IDE compilation reports
-`unknown`; source identity does not prove a flashed binary identity. Constants
+script supplies the source SHA256 as MECH_BUILD_ID and supplies MECH_CORE_ID only
+after verifying installed core 1.6.0. Unverified builds (including direct IDE
+builds) report `unknown` for both identities unless explicitly supplied; source
+identity does not prove a flashed binary identity. Constants
 are formatted from the values actually compiled into the sketch.
 
 ENDED reason is host_stop, watchdog, manual_override or transport_fault; final
@@ -103,3 +105,9 @@ stall, reset and disconnect behavior still require the checks in hardware-valida
 The host readiness query sends a newline before `?` to discard any incomplete
 frame left by a previous short write. Fault teardown invalidates capability and
 metadata; a delayed READY marker alone cannot make a faulted connection runnable.
+
+An explicit H/X override is still attempted after an unconfirmed protocol stop.
+The host prefixes it with newline to end any partial frame, leaves the session
+faulted and does not claim confirmation. The UI ? key renegotiates readiness
+through the same resynchronization path; it is refused during an active run.
+Firmware ERROR records, including completed-ID exhaustion, are shown to the user.

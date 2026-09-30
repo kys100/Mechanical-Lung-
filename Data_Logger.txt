@@ -3,7 +3,8 @@
 
 Protocol 2 timed runs require a complete firmware metadata handshake. Captures
 include raw sample CSV, peak CSV and a session manifest for deterministic replay.
-Use H to request confirmed hold, p to discard a stopped session, q to close.
+Use H to request confirmed hold, p to stop and discard the active run, ? to
+renegotiate readiness after a fault, and q to close.
 Flow timestamps describe read completion; interpolation does not increase sensor
 precision. --avg controls segmentation; --peak-smooth independently defaults to 9.
 Measured flow is standard L/min. Targets are geometric local L/min unless measured
@@ -71,7 +72,7 @@ COMMANDS = {
     'h': "Hold / idle", 'H': "Hold / idle", '0': "Hold / idle",
     'x': "Calibration hold", 'X': "Calibration hold",
     'm': "Toggle Monitor block", 'M': "Toggle Monitor block",
-    '?': "Reprint sketch banner",
+    '?': "Renegotiate firmware readiness",
 }
 
 PRESET_KEYS = frozenset('1234')
@@ -84,7 +85,7 @@ PHASE_NAMES = {-1: "n/a", 0: "expiration", 1: "inspiration"}
 
 COMMAND_HELP = ("Click a plot window, then press: "
                 "1-4 preset (auto-records, timed) | s sine | H hold | "
-                "X calib | m monitor | p abort run | q quit")
+                "X calib | m monitor | p stop/discard run | ? renegotiate after fault | q quit")
 
 # Recordings always go here, next to the script itself — not wherever the
 # process's current working directory happens to be. That directory varies
@@ -110,6 +111,19 @@ Sample = namedtuple("Sample", [
     "pa_time_us", "segment_id", "discontinuity_reason", "target_reference_resolved",
     "target_peak_local_lmin",
 ])
+
+
+class BoardTimeReset(ValueError):
+    """Only board clock discontinuities use this exception category."""
+
+
+class RecordingFault(Exception):
+    """Carry an operation's classification across detector callback boundaries."""
+
+    def __init__(self, kind, cause):
+        super().__init__(str(cause))
+        self.kind = kind
+        self.cause = cause
 
 
 class MillisUnwrapper:
@@ -417,13 +431,20 @@ class SerialLink:
         if start_reader:
             self._thread.start()
 
-    def _write_bytes_locked(self, data):
-        """Caller holds the write lock; a complete write is not an ACK."""
+    def _write_bytes_locked(self, data, timeout=None):
+        """Guard timeout configuration and writes; caller holds the write lock."""
         try:
-            if self.ser.write(data) != len(data):
-                raise OSError('short serial write')
+            previous_timeout = getattr(self.ser, 'write_timeout', None)
+            if timeout is not None:
+                self.ser.write_timeout = timeout
+            try:
+                if self.ser.write(data) != len(data):
+                    raise OSError('short serial write')
+            finally:
+                if timeout is not None:
+                    self.ser.write_timeout = previous_timeout
             return True
-        except (serial.SerialException, OSError) as exc:
+        except (serial.SerialException, OSError, ValueError) as exc:
             self._heartbeat_enabled = False
             self.connection_error = str(exc)
             self.connected = False
@@ -434,17 +455,38 @@ class SerialLink:
     def send_command(self, ch):
         if ch not in COMMANDS:
             return False
+        if ch == '?':
+            with self._run_lock:
+                if self.state in ('STARTING', 'RUNNING', 'STOPPING'):
+                    print('-> finish the active run before renegotiating readiness')
+                    return False
+                self._ready_event.clear()
+                self.protocol_version = None
+                self.metadata = None
+                self._meta_pending = None
+                self._meta_build = None
+                self._meta_invalid = False
+                with self._serial_write_lock:
+                    return self._write_bytes_locked(b'\n?')
         if ch in PRESET_KEYS:
             return self.begin_timed_run(int(ch)-1, ch)
         if ch in MOTION_OVERRIDE_KEYS:
             if self.run_in_progress() and not self.stop_run():
                 return False
             return self.begin_timed_run(-2, ch)
+        confirmed = self.state != 'FAULTED'
         if ch in SAFETY_OVERRIDE_KEYS and self.run_in_progress():
-            if not self.stop_run():
-                return False
-        with self._serial_write_lock:
-            return self._write_bytes_locked(ch.encode('ascii'))
+            confirmed = self.stop_run()
+        # An unconfirmed protocol stop must not suppress an explicit operator
+        # override. Resynchronize any partial frame before the legacy command.
+        data = (('\n' if ch in SAFETY_OVERRIDE_KEYS else '') + ch).encode('ascii')
+        with self._run_lock:
+            owned_id = self.run_id if self.state in ('STARTING', 'RUNNING', 'STOPPING') else None
+            with self._serial_write_lock:
+                written = self._write_bytes_locked(data)
+        if not written and owned_id is not None:
+            self._fault('transport_fault', expected_run_id=owned_id)
+        return written and confirmed
 
     def _send_heartbeat(self):
         with self._serial_write_lock:
@@ -457,12 +499,8 @@ class SerialLink:
             return ok
 
     def wait_until_ready(self, timeout):
-        self._ready_event.clear()
-        self.protocol_version = None
-        self.metadata = None
-        with self._serial_write_lock:
-            if not self._write_bytes_locked(b'\n?'):
-                return False
+        if not self.send_command('?'):
+            return False
         return self._ready_event.wait(timeout)
 
     def _reader_loop(self):
@@ -516,6 +554,17 @@ class SerialLink:
             self._handle_marker(line)
 
     def _handle_marker(self, line):
+        try:
+            self._process_marker(line)
+        except RecordingFault as exc:
+            self._fault(exc.kind, exc.cause)
+        except OSError as exc:
+            self._fault('storage_fault', exc)
+        except Exception as exc:
+            traceback.print_exc()
+            self._fault('analysis_fault', exc)
+
+    def _process_marker(self, line):
         parts = line[2:].split(',')
         kind = parts[0]
         if kind == 'BOOT':
@@ -554,6 +603,8 @@ class SerialLink:
                 with self._run_lock:
                     if self.state == 'FAULTED' and self.metadata is not None:
                         self.state = 'IDLE'
+        elif kind == 'ERROR':
+            print(f'-> firmware error: {line[2:]}')
         elif kind == 'STARTED' and len(parts) == 6 and parts[1] == '2':
             try:
                 start_ms, start_us = uint32(parts[4]), uint32(parts[5])
@@ -627,14 +678,34 @@ class SerialLink:
                 for series in getattr(self, name):
                     series.clear()
 
+    def _call_detector_locked(self, method, *args):
+        """Detach a failed detector before teardown can retry its callback.
+
+        Caller holds the recording lock. Lifecycle teardown is performed by
+        the caller after releasing that lock to preserve lock ordering.
+        """
+        if self._detector is None:
+            return
+        try:
+            return getattr(self._detector, method)(*args)
+        except RecordingFault:
+            self._detector = None
+            raise
+        except OSError as exc:
+            self._detector = None
+            raise RecordingFault('storage_fault', exc) from exc
+        except Exception as exc:
+            self._detector = None
+            traceback.print_exc()
+            raise RecordingFault('analysis_fault', exc) from exc
+
     def _break_locked(self, reason, before_seq=None):
         self._flow_hist.clear()
         self._flow_sum = 0.0
         self._segment_id += 1
-        if self._detector is not None:
-            self._detector.break_continuity(reason)
         if self.manifest is not None:
             self.manifest['boundaries'].append(dict(after_seq=self._last_seq, before_seq=before_seq, reason=reason))
+        self._call_detector_locked('break_continuity', reason)
 
     def _handle_data_line(self, line):
         try:
@@ -654,10 +725,19 @@ class SerialLink:
             if fault is None:
                 try:
                     sample = self._sample_from_wire(wire, active)
-                except ValueError:
+                except BoardTimeReset:
                     fault = 'board_time_reset' if active else None
                     if not active:
                         self._reset_analysis_state(wire['ms'], wire['row_us'] or 0)
+                    sample = None
+                except RecordingFault as exc:
+                    fault = exc.kind
+                    self.connection_error = str(exc.cause)
+                    sample = None
+                except Exception:
+                    traceback.print_exc()
+                    fault = 'analysis_fault'
+                    self._detector = None
                     sample = None
                 if sample is not None:
                     self._plot_sample(sample)
@@ -676,29 +756,25 @@ class SerialLink:
                             fault = 'format_fault'
                         if fault is None:
                             try:
-                                self._detector.push(sample)
-                            except OSError as exc:
-                                fault = 'storage_fault'
-                                self.connection_error = str(exc)
-                            except Exception:
-                                traceback.print_exc()
-                                fault = 'analysis_fault'
-                                self._detector = None  # do not retry a broken callback/flush
+                                self._call_detector_locked('push', sample)
+                            except RecordingFault as exc:
+                                fault = exc.kind
+                                self.connection_error = str(exc.cause)
         if fault:
             self._fault(fault)
 
     def _sample_from_wire(self, w, active):
         elapsed_s, reset = self._clock.update(w['ms'])
         if reset:
-            raise ValueError('millis reset')
+            raise BoardTimeReset('millis reset')
         if w['protocol'] == 2:
             delta = (w['row_us'] - self._last_row_us) & 0xffffffff
             if delta > 0x7fffffff:
-                raise ValueError('micros reset')
+                raise BoardTimeReset('micros reset')
             self._elapsed_row_us += delta
             self._last_row_us = w['row_us']
             if active and abs(self._elapsed_row_us/1e6-elapsed_s) > .003:
-                raise ValueError('millis/micros disagree')
+                raise BoardTimeReset('millis/micros disagree')
             row_time_us = self._elapsed_row_us
             flow_time_us = row_time_us-w['flow_age_us'] if w['flow_age_us'] >= 0 else row_time_us
             t_s = flow_time_us/1e6
@@ -779,7 +855,13 @@ class SerialLink:
                     list(self.preset), list(self.clamped))
 
     def _write_peak_row(self, event):
-        self._peak_writer.writerow(event_record(event))
+        try:
+            self._peak_writer.writerow(event_record(event))
+        except OSError:
+            raise
+        except Exception as exc:
+            traceback.print_exc()
+            raise RecordingFault('format_fault', exc) from exc
         self._peak_file.flush()
         if event['excursion_complete'] and event['sample'].cycle_id is not None:
             self._completed_phases.add(event['sample'].cycle_id*2+event['sample'].phase)
@@ -872,11 +954,15 @@ class SerialLink:
         counters = {}
         try:
             if self._detector is not None:
-                self._detector.flush()
+                self._call_detector_locked('flush')
                 counters = {name: getattr(self._detector, name) for name in (
                     'count', 'discarded', 'target_passes', 'target_misses', 'partial_excursions',
                     'warmup_peaks', 'reference_unresolved', 'pressure_incomplete', 'timing_failures',
                     'qualified_peaks', 'unqualified_peaks')}
+        except RecordingFault as exc:
+            failed = True
+            reason = exc.kind
+            print(f'-> {exc.kind} finalizing recording: {exc.cause}')
         except OSError as exc:
             failed = True
             reason = 'storage_fault'
@@ -915,10 +1001,16 @@ class SerialLink:
 
     def _count_bad_line(self):
         self.bad_lines += 1
+        fault = None
         with self._record_lock:
             if self._record_started:
                 self._run_bad_lines += 1
-                self._break_locked('malformed_data')
+                try:
+                    self._break_locked('malformed_data')
+                except RecordingFault as exc:
+                    fault = exc
+        if fault is not None:
+            self._fault(fault.kind, fault.cause)
 
     def _cancel_run_timer_locked(self):
         self._run_generation += 1
@@ -946,8 +1038,9 @@ class SerialLink:
                 return False
             with self._serial_write_lock:
                 self._heartbeat_enabled = True
-                self.ser.write_timeout = max(.001, deadline-time.monotonic())
-                sent = self._write_bytes_locked(f'@START,{self.run_id},{self.mode}\n'.encode('ascii'))
+                sent = self._write_bytes_locked(
+                    f'@START,{self.run_id},{self.mode}\n'.encode('ascii'),
+                    timeout=max(.001, deadline-time.monotonic()))
         # Reader takes both locks for ACK; no lifecycle/record lock while waiting.
         if not sent or not started_event.wait(max(0, deadline-time.monotonic())):
             self._fault('start_unconfirmed', expected_run_id=owned_id)
@@ -975,8 +1068,9 @@ class SerialLink:
             with self._serial_write_lock:
                 self._heartbeat_enabled = False
                 if owner:
-                    self.ser.write_timeout = max(.001, deadline-time.monotonic())
-                    sent = self._write_bytes_locked(f'@STOP,{owned_id}\n'.encode('ascii'))
+                    sent = self._write_bytes_locked(
+                        f'@STOP,{owned_id}\n'.encode('ascii'),
+                        timeout=max(.001, deadline-time.monotonic()))
                 else:
                     sent = True
         confirmed = sent and ended_event.wait(min(1.0, max(0, deadline-time.monotonic())))
@@ -984,8 +1078,9 @@ class SerialLink:
             with self._run_lock:
                 if self.run_id == owned_id and self.state == 'STOPPING' and time.monotonic() < deadline:
                     with self._serial_write_lock:
-                        self.ser.write_timeout = max(.001, deadline-time.monotonic())
-                        sent = self._write_bytes_locked(f'@STOP,{owned_id}\n'.encode('ascii'))
+                        sent = self._write_bytes_locked(
+                            f'@STOP,{owned_id}\n'.encode('ascii'),
+                            timeout=max(.001, deadline-time.monotonic()))
             confirmed = sent and ended_event.wait(max(0, deadline-time.monotonic()))
         elif not confirmed and sent:
             confirmed = ended_event.wait(max(0, deadline-time.monotonic()))

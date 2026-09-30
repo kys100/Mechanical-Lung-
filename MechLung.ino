@@ -247,7 +247,6 @@ static bool sfm3000ReadFlow() {
 
   if (++sfm_consecutive_fails >= SFM_FAIL_REINIT_THRESHOLD) {
     sfm_consecutive_fails = 0;
-    sfm_reinit_count++;
     sfm_ok = false;
     sfm_recovery_state = SFM_RECOVERY_RETRY_WAIT;
     sfm_recovery_due_us = micros();
@@ -802,6 +801,9 @@ static void handleFrame(char *line) {
 #ifndef MECH_BUILD_ID
 #define MECH_BUILD_ID "unknown"
 #endif
+#ifndef MECH_CORE_ID
+#define MECH_CORE_ID "unknown"
+#endif
 // Values come from the same compiled constants as the waveform. The compile
 // script provides a source digest; it is provenance, not a binary signature.
 static int meta_step = -1;
@@ -817,7 +819,7 @@ static bool serviceMeta() {
       ok = enqueueFormat(false, "# META_BEGIN,2,%s\n", MECH_BUILD_ID);
       break;
     case 2:
-      ok = enqueueText("# META,2,core,renesas_uno_1.6.0\n");
+      ok = enqueueFormat(false, "# META,2,core,%s\n", MECH_CORE_ID);
       break;
     case 3:
       ok = enqueueFormat(false, "# META,2,tidal_ml,%.8g\n", V_TIDAL_ML);

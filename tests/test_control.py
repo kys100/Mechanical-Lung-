@@ -126,3 +126,54 @@ class Control(unittest.TestCase):
     def test_ready_query_resynchronizes_partial_frame(self):
         s=link();s.wait_until_ready(0)
         self.assertEqual(s.ser.writes,[b'\n?'])
+    def test_safety_override_sent_after_unconfirmed_stop(self):
+        for command in ('H','X'):
+            with self.subTest(command=command),tempfile.TemporaryDirectory() as d:
+                s=link();recording(s,d);s._heartbeat_enabled=True
+                original=s.ser.write
+                def fail_stop(data):
+                    if data.startswith(b'@STOP'):
+                        original(data[:7])
+                        return 7
+                    return original(data)
+                s.ser.write=fail_stop
+                output=io.StringIO()
+                with contextlib.redirect_stdout(output):self.assertFalse(s.send_command(command))
+                self.assertEqual(s.ser.writes[-1],('\n'+command).encode())
+                self.assertEqual(s.state,'FAULTED');self.assertFalse(s._heartbeat_enabled)
+                self.assertNotIn('hold confirmed',output.getvalue())
+    def test_timeout_property_failure_is_guarded(self):
+        from helpers import FakeSerial
+        for restore in (False,True):
+            with self.subTest(restore=restore),tempfile.TemporaryDirectory() as d:
+                s=link();recording(s,d);s._heartbeat_enabled=True
+                class TimeoutFaultSerial(FakeSerial):
+                    @property
+                    def write_timeout(self):return self._timeout
+                    @write_timeout.setter
+                    def write_timeout(self,value):
+                        self.assignments=getattr(self,'assignments',0)+1
+                        if self.assignments==(3 if restore else 2):
+                            raise logger.serial.SerialException('timeout property failed')
+                        self._timeout=value
+                s.ser=TimeoutFaultSerial()
+                self.assertFalse(s.stop_run())
+                self.assertEqual(s.state,'FAULTED');self.assertFalse(s._heartbeat_enabled)
+                self.assertIn('timeout property failed',s.connection_error)
+    def test_timeout_is_restored_and_ui_query_renegotiates(self):
+        s=link();s.ser.write_timeout=.7
+        with s._serial_write_lock:self.assertTrue(s._write_bytes_locked(b'm',timeout=.2))
+        self.assertEqual(s.ser.write_timeout,.7)
+        ready(s);s._fault('test_fault')
+        self.assertTrue(s.send_command('?'))
+        self.assertEqual(s.ser.writes[-1],b'\n?');self.assertIsNone(s.metadata)
+        s.state='RUNNING';writes=len(s.ser.writes)
+        self.assertFalse(s.send_command('?'));self.assertEqual(len(s.ser.writes),writes)
+    def test_generic_command_short_write_faults_active_capture(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=link();recording(s,d);s._heartbeat_enabled=True
+            s.ser.write=lambda data:0
+            self.assertFalse(s.send_command('m'))
+            self.assertEqual(s.state,'FAULTED')
+            self.assertEqual(s.manifest['termination_reason'],'transport_fault')
+            self.assertIsNone(s._record_file);self.assertFalse(s._heartbeat_enabled)

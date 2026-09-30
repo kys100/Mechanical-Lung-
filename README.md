@@ -13,7 +13,7 @@ python Data_Logger.txt --port /dev/ttyACM0
 
 The logger's three Matplotlib plots accept 1–4 (timed preset), s (owned demo),
 H (stop and keep), p (stop and discard), X (stop then calibration hold), m (firmware
-monitor), and q (close). A timed run requires matching STARTED/ENDED and complete
+monitor), ? (renegotiate after fault), and q (close). A timed run requires matching STARTED/ENDED and complete
 metadata. Failed stops are reported unconfirmed and disable heartbeats; recording
 continues through the ordered tail. Recording allocation failure prevents motion.
 Legacy DATA can be displayed but cannot start a new timed recording.
@@ -30,8 +30,10 @@ for changed qualification, warmup populations, timing and partial-event behavior
 Install Arduino CLI 1.5.1 and `arduino-cli core install arduino:renesas_uno@1.6.0`.
 The build script rejects another installed core version and uses the UNO R4 WiFi
 FQBN. It creates a matching sketch folder/build tree in a temporary directory,
-passes the source SHA256 as MECH_BUILD_ID, and deletes build artifacts afterward.
-The source ID is not a deployed binary signature; direct IDE builds report unknown.
+passes the source SHA256 as MECH_BUILD_ID and verified core as MECH_CORE_ID,
+and deletes build artifacts afterward.
+The source ID is not a deployed binary signature. Builds without explicitly
+supplied identities, including ordinary IDE builds, report both as unknown.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 MPLBACKEND=Agg python3 -m unittest discover -s tests -p 'test_*.py' -v

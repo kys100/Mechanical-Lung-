@@ -7,7 +7,11 @@ The final manifest is atomically replaced only after stream flush/close attempts
 Storage/analysis/format/transport failures retain partial files and disable owned
 heartbeats. A failed allocation prevents START. Explicit p discards only the
 stopped session's paths. H preserves them. Unexpected reader failures retain a
-traceback; normal close drains confirmation before stopping the reader.
+traceback; normal close drains confirmation before stopping the reader. Continuity
+boundaries use the same detector callback error handling as ordinary samples:
+peak writer OSError is a storage fault, serialization failure is a format fault,
+and a detector failure is an analysis fault. Failed detectors are detached before
+teardown so their callback is not retried.
 
 Each accepted row must match the acknowledged ID and preset. STARTED resets
 analysis and plot histories. Reset or another active identity interrupts the

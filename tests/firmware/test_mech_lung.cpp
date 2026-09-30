@@ -204,9 +204,22 @@ int main(int argc, char **argv) {
     frame("\n?");runFor(100000);
     assert(current_preset==-1);
     assert(Serial.text.find("# READY_QUERY")!=std::string::npos);
+  } else if(name=="sfm_reinit_count") {
+    Wire.fail=true;
+    for(int i=0;i<SFM_FAIL_REINIT_THRESHOLD;i++) sfm3000ReadFlow();
+    assert(!sfm_ok && sfm_reinit_count==0);
+    sfm3000Service(micros());assert(sfm_reinit_count==1);
+    sfm3000Service(micros());assert(sfm_reinit_count==1);
+    fake_us=sfm_recovery_due_us;sfm3000Service(micros());assert(sfm_reinit_count==2);
+  } else if(name=="override_resync") {
+    frame("@START,0123456789abcdef,P0\n");
+    frame("@STOP,01");
+    frame("\nH");
+    assert(current_preset==-1 && last_dac_out==corrected_centre_dac);
   } else if(name=="metadata") {
     frame("?"); runFor(100000);
     assert(Serial.text.find("# META_BEGIN,2,")!=std::string::npos);
+    assert(Serial.text.find(std::string("# META,2,core,")+MECH_CORE_ID+"\n")!=std::string::npos);
     assert(Serial.text.find("# META,2,dac_centre,1450")!=std::string::npos);
     assert(Serial.text.find("# META_END")<Serial.text.find("# READY_QUERY"));
   } else {
