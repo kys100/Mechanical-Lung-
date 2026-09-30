@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
     for(int i=0;i<20;i++) serviceTx();
     assert(Serial.text=="alpha\nbeta\n");
   } else if (name == "tx_overflow") {
-    for(int i=0;i<20;i++) enqueueText("telemetry\n");
+    for(int i=0;i<20;i++) enqueueText("telemetry\n",false,true);
     assert(tx_count==6 && tx_dropped_total==14);
     frame("@START,0123456789abcdef,P0\n");
     assert(current_preset==0 && tx_count==7);
@@ -122,14 +122,50 @@ int main(int argc, char **argv) {
     for(size_t i=1;i<dac_times.size();i++) assert(uint32_t(dac_times[i]-dac_times[i-1])<=16000);
     assert(dac_times.back()-1000000<=3010000);
     std::set<int> selections;
-    for(const auto &t:transactions) if(t.bus==1) selections.insert(t.address);
-    assert(selections.count(MUX_ADDR));
+    for(const auto &t:transactions) if(t.bus==1) selections.insert(t.channel);
+    assert(selections.size()==7);
+    for(int channel=0;channel<7;channel++) assert(selections.count(channel));
   } else if(name=="sfm_crc") {
+    assert(sfmCheckCrc(0,0,0));
+    assert(sfmCheckCrc(0xbe,0xef,0x13));
+    assert(!sfmCheckCrc(0xbe,0xef,0x92));
     uint16_t value;
     assert(sfm3000ReadRaw(value) && value==33400 && Wire.requested==3);
     Wire.corrupt=true;
     assert(!sfm3000ReadRaw(value));
+    assert(!sfm3000Init());
+    sfm_ok=false;
+    sfm_recovery_state=SFM_RECOVERY_DISCARD_WAIT;
+    sfm_recovery_due_us=micros();
+    sfm3000Service(micros());
+    assert(!sfm_ok);
+    Wire.corrupt=false; Wire.short_read=true;
+    assert(!sfm3000ReadRaw(value));
     assert(sdpCheckCrc(0xbe,0xef,0x92));
+  } else if(name=="drop_counter_reset") {
+    Serial.capacity=0;
+    frame("@START,0123456789abcdef,P0\n");runFor(200000);
+    assert(tx_dropped_total>0);
+    frame("@STOP,0123456789abcdef\n");
+    Serial.capacity=64;runFor(100000);
+    Serial.text.clear();
+    frame("@START,fedcba9876543210,P0\n");runFor(200000);
+    frame("@STOP,fedcba9876543210\n");runFor(100000);
+    assert(tx_dropped_total==0);
+    assert(Serial.text.find("host_stop,0\n")!=std::string::npos);
+  } else if(name=="recovery_wait") {
+    psens[0].recovery_state=SDP_RECOVERY_RETRY_WAIT;
+    scan_active=true;scan_ch=0;sensor_step=1;
+    serviceSensors();assert(sensor_step==2);
+    const auto before=micros();serviceSensors();
+    assert(psens[0].recovery_due_us==before+50+1000);
+    assert(transactions.back().channel==0);
+    assert(psens[0].recovery_state==SDP_RECOVERY_WAIT_START);
+    fake_us=psens[0].recovery_due_us;
+    scan_ch=0;sensor_step=1;serviceSensors();serviceSensors();
+    assert(psens[0].recovery_state==SDP_RECOVERY_WAIT_READY);
+    assert(psens[0].recovery_due_us==micros()+25000);
+    assert(transactions.back().channel==0);
   } else if(name=="metadata") {
     frame("?"); runFor(100000);
     assert(Serial.text.find("# META_BEGIN,2,")!=std::string::npos);

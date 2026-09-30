@@ -243,18 +243,22 @@ static void sfm3000Service(uint32_t now_us) {
   sfm3000BeginRecovery(now_us);
 }
 
+static bool sfmCheckCrc(uint8_t hi, uint8_t lo, uint8_t expected) {
+  // SFM3xxx: polynomial 0x31, initial value 0x00 (SDP uses 0xff).
+  uint8_t crc = 0;
+  for (uint8_t byte : {hi, lo}) {
+    crc ^= byte;
+    for (uint8_t bit = 0; bit < 8; ++bit)
+      crc = crc & 0x80 ? (crc << 1) ^ 0x31 : crc << 1;
+  }
+  return crc == expected;
+}
 static bool sfm3000ReadRaw(uint16_t &raw_out) {
   if (Wire.requestFrom((int)SFM3000_I2C_ADDR, 3) != 3) return false;
   if (Wire.available() < 3) return false;
   const uint8_t hi = Wire.read();
   const uint8_t lo = Wire.read();
-  // SFM3xxx CRC: polynomial 0x31, initial value 0x00 (SDP uses 0xff).
-  uint8_t crc = 0;
-  for (uint8_t byte : {hi, lo}) {
-    crc ^= byte;
-    for (uint8_t b = 0; b < 8; ++b) crc = crc & 0x80 ? (crc << 1) ^ 0x31 : crc << 1;
-  }
-  if (crc != (uint8_t)Wire.read()) return false;
+  if (!sfmCheckCrc(hi, lo, Wire.read())) return false;
   raw_out = ((uint16_t)hi << 8) | lo;
   return true;
 }
@@ -696,10 +700,10 @@ static TxRecord tx[TX_COUNT];
 static uint8_t tx_head = 0, tx_count = 0;
 static uint32_t tx_dropped_total = 0;
 static char format_buffer[TX_SIZE];
-static bool enqueueText(const char *text, bool control = false) {
+static bool enqueueText(const char *text, bool control = false, bool telemetry = false) {
   const size_t length = strlen(text);
   if (length >= TX_SIZE || tx_count >= (control ? TX_COUNT : TX_COUNT - 2)) {
-    if (!control) ++tx_dropped_total;
+    if (telemetry) ++tx_dropped_total;
     return false;
   }
   TxRecord &r = tx[(tx_head + tx_count) % TX_COUNT];
@@ -709,7 +713,7 @@ static bool enqueueText(const char *text, bool control = false) {
 static bool enqueueFormat(bool control, const char *format, ...) {
   va_list args; va_start(args, format);
   const int n = vsnprintf(format_buffer, TX_SIZE, format, args); va_end(args);
-  if (n < 0 || n >= (int)TX_SIZE) { if (!control) ++tx_dropped_total; return false; }
+  if (n < 0 || n >= (int)TX_SIZE) return false;
   return enqueueText(format_buffer, control);
 }
 static void serviceTx() {
@@ -955,7 +959,7 @@ static void closeScan() {
         (unsigned long)scan_start_us, (unsigned long)missed_slots_total, (unsigned long)tx_dropped_total);
   fits = fits && appendField(used, "\n");
   if (fits) {
-    if (enqueueText(format_buffer)) final_enqueued_seq = seq;
+    if (enqueueText(format_buffer, false, true)) final_enqueued_seq = seq;
   } else {
     ++tx_dropped_total;
   }
