@@ -2,31 +2,31 @@
 
 Generated with the **improve** skill on 2026-09-30 against `976bd8a58cb3400d102cf829f8c747d2042a12aa`.
 
-Read [Plan 001: Make motion control, acquisition, and peak qualification auditable](001-fix-audit-findings.md) before implementation. It is a single self-contained handoff covering the requested previous audit, organized into eleven stage-sized changes. The advisor has written planning documents only; none of the fixes or proposed tests has been implemented.
+Read [Plan 001: Make motion control, acquisition, and peak qualification auditable](001-fix-audit-findings.md) before implementation. It is a single self-contained handoff covering the requested previous audit, organized into eleven stage-sized changes. The software repairs have been implemented and independently verified through `e17d7edecc9f34595b65852d63bc6b712d0ddb42`. Required physical validation remains blocked because no rig is available.
 
-The user selected the already-audited issues, so this follows the skill's `plan <description>` variant. No additional selection question, broad re-audit, executor dispatch, external issue, commit or push was required.
+The user selected the already-audited issues, so this follows the skill's `plan <description>` variant. The initial planning phase needed no additional selection question or broad re-audit. The user subsequently authorized plan publication, implementation, and code publication.
 
 ## Execution order and status
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |---|---|---|---|---|---|
-| 001 | Motion control, acquisition and peak qualification repairs | P1 | L | — | TODO |
+| 001 | Motion control, acquisition and peak qualification repairs | P1 | L | — | BLOCKED — software DONE; physical validation unavailable |
 
 Status values: TODO, IN PROGRESS, DONE, BLOCKED (with reason), REJECTED (with rationale). Update a stage only after its verification gates produce observed results. Overall DONE requires both software and required physical validation; software completion with no rig must leave the physical portion explicitly BLOCKED.
 
 | Stage | Work package | Priority | Effort | Fix risk | Depends on | Status |
 |---|---|---|---|---|---|---|
-| 1 | Repository-owned Python/native/Arduino verification | P1 | M | LOW | — | TODO |
-| 2 | Bounded USB/RX output and control-loop priority | P1 | L | HIGH | 1 | TODO |
-| 3 | Watchdog ownership and acknowledged starts/stops | P1 | L | HIGH | 1, 2 | TODO |
-| 4 | Recording identity and final-row drain barrier | P1 | M | MED | 3 | TODO |
-| 5 | Common acquisition schedule and bounded I2C work | P1 | L | HIGH | 2, 4 | TODO |
-| 6 | Continuity breaks, numeric validation and baseline re-arm | P1 | M | MED | 4, 5 | TODO |
-| 7 | Supported smoothing, measurement timestamps and qualification | P2 | L | MED | 5, 6 | TODO |
-| 8 | Session manifest, schema versions and deterministic replay | P2 | M | MED | 3–7 | TODO |
-| 9 | Explicit flow reference and calibration boundaries | P2 | M + rig evidence | HIGH | 7, 8 | TODO |
-| 10 | CRC, fault handling, summaries, plots and documentation | P2/P3 | M | MED | 3–9 | TODO |
-| 11 | Integrated regression and physical validation | P1 release gate | M + rig time | HIGH | 1–10 | TODO; physical rig currently unavailable |
+| 1 | Repository-owned Python/native/Arduino verification | P1 | M | LOW | — | DONE |
+| 2 | Bounded USB/RX output and control-loop priority | P1 | L | HIGH | 1 | DONE |
+| 3 | Watchdog ownership and acknowledged starts/stops | P1 | L | HIGH | 1, 2 | DONE |
+| 4 | Recording identity and final-row drain barrier | P1 | M | MED | 3 | DONE |
+| 5 | Common acquisition schedule and bounded I2C work | P1 | L | HIGH | 2, 4 | DONE |
+| 6 | Continuity breaks, numeric validation and baseline re-arm | P1 | M | MED | 4, 5 | DONE |
+| 7 | Supported smoothing, measurement timestamps and qualification | P2 | L | MED | 5, 6 | DONE |
+| 8 | Session manifest, schema versions and deterministic replay | P2 | M | MED | 3–7 | DONE |
+| 9 | Explicit flow reference and calibration boundaries | P2 | M + rig evidence | HIGH | 7, 8 | Software DONE; physical BLOCKED (no rig) |
+| 10 | CRC, fault handling, summaries, plots and documentation | P2/P3 | M | MED | 3–9 | DONE |
+| 11 | Integrated regression and physical validation | P1 release gate | M + rig time | HIGH | 1–10 | Software DONE; physical BLOCKED (no rig) |
 
 Effort: S = hours, M = roughly a day, L = multiple days; estimates include tests and are planning ranges, not delivery commitments. Several stages touch the same functions: do not execute them concurrently in the same checkout. Dependency ordering takes precedence over ranking individual defects by severity.
 
@@ -84,8 +84,70 @@ The IDs preserve the previous audit's mapping. Confidence is HIGH for code/repro
 - **Physical power-cycle recovery circuit or automatic recalibration:** deferred outside application edits. Expose persistent failure and require rig evidence.
 - **Treat inability to record as a new silent defect:** rejected; existing code explicitly warns before motion-only operation. The plan keeps motion/recording state visible and truthful instead of broadening this into an unrelated product change.
 
-## Planning validation and limits
+## Historical planning validation and limits
 
 Source hashes and revision match the previous audit; its software findings/build results remain applicable. Current recon reread the affected functions, the improve skill/template/playbook, audit evidence and validation record. No application tests/builds were rerun for these planning-only changes; no dependencies were installed in this turn. Plan verification commands are clearly labeled as future gates where the required files do not yet exist.
 
-The current task does not perform new dependency vulnerability research, physical measurements, implementation, external publication or a new CodeRabbit review. Prior CodeRabbit attempts were skipped/error, including repository authorization failure; no independent review pass is being claimed. No rig is available to close physical USB, timing, position-calibration or standard-flow accuracy questions.
+The planning-only phase did not implement or publish code or run a new CodeRabbit review. Its earlier source-audit review attempts were skipped/error. The subsequent execution and successful implementation reviews are recorded below. Physical USB, timing, position-calibration and standard-flow accuracy questions still require a rig.
+
+## Execution evidence (2026-09-30)
+
+**Software: DONE. Overall plan: BLOCKED only on required physical validation.**
+The user authorized implementation and publication after approving the plan.
+One executor used an isolated worktree; the reviewer read the full implementation,
+all tests and final revision diffs, then independently checked the gates. Source
+commit: `e17d7edecc9f34595b65852d63bc6b712d0ddb42`. Publication is restricted to
+`coderabbit/audit-logger-peak-detector-firmware/51736d42`; a second remote branch
+is not permitted by this workspace.
+
+### Observed verification
+
+Commands ran from the repository/worktree root with Python 3.9.25, pyserial 3.5,
+Matplotlib 3.9.4, GCC 11.5.0, Arduino CLI 1.5.1 and core
+`arduino:renesas_uno@1.6.0`.
+
+| Check | Command / evidence | Result |
+|---|---|---|
+| Full software gate at `806d2bb` | `PATH=/tmp/mech-audit/venv/bin:$PATH ARDUINO_CLI=/tmp/mech-audit/arduino-cli bash tools/verify.sh` | PASS, independently rerun: 61 Python tests, 21 native scenarios plus explicit-core metadata check, real Arduino build, syntax and whitespace |
+| Final host/integration suite at `e17d7ed` | `PYTHONDONTWRITEBYTECODE=1 MPLBACKEND=Agg /tmp/mech-audit/venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v` | PASS, independently rerun: 63 tests; no skipped or expected-failure cases |
+| Final native/build coverage | Compared `git diff --name-only 806d2bb..e17d7ed`; only logger and two Python tests changed | PASS reused: native source, harness, scripts, dependencies and toolchain identical |
+| UNO R4 memory | Actual `arduino:renesas_uno:unor4wifi` compile | 72,388 bytes flash; 16,776 globals; 15,992 remaining, below 24 KiB global limit; warnings in core only |
+| Syntax and CLI | Python `compile()` for both modules; `PYTHONDONTWRITEBYTECODE=1 MPLBACKEND=Agg /tmp/mech-audit/venv/bin/python Data_Logger.txt --help` | PASS at final source |
+| Full patch hygiene | `git diff --check 7fc74b7..HEAD` | PASS |
+| Calibration/model preservation | Compared 14 declarations and seven entire geometry/waveform function bodies to `976bd8a`, ignoring comments/whitespace | PASS; no calibration or waveform changes |
+| Reproduction from files | Actual-sketch output through split-frame host input, recording, detector and replay CLI; normal and malformed/lost-row sessions | PASS in integration suite |
+| Physical measurements | Six entries in [hardware results](../docs/hardware-validation-results.json) | BLOCKED; no rig, instrument evidence, flashing or Jrk changes |
+
+The `/tmp/mech-audit` tool locations are sandbox-specific. The root README gives
+portable setup commands and tool overrides.
+
+### Reviews and resolved findings
+
+- CodeRabbit first implementation pass completed with **four findings**: one
+  major safety-override path issue and three minor recovery-count, timeout-setter
+  and help-text issues. All four were resolved and covered by checks.
+- Its second pass reviewed the full implementation and reported **zero findings**.
+- A final incremental pass reviewed the last logger/cleanup regressions and
+  reported **zero findings**. No authorization/network blocker affected these
+  implementation reviews.
+- Manual review also repaired partial-record formatting, session/generation
+  races, deadline accounting, manifest completion ordering, stale handshakes,
+  per-session loss counts, sensor-specific CRC vectors, full uint32 final sequence
+  output, continuity-callback error classification, core identity, recovery
+  display state and compound allocation cleanup failures. The initially failing
+  gap/storage-error reproduction now passes without escaping or misclassification.
+
+### Implementation choices and remaining limits
+
+- Logger and firmware use protocol 2 together. Legacy DATA is display-only for
+  the new logger; recording allocation failure prevents START.
+- Completed run IDs are retained without eviction for **64 owned sessions per
+  boot**. Exhaustion rejects new starts until a deliberate board reset, rather
+  than allowing a delayed completed ID to restart motion.
+- Build and core identities are supplied by the verified build script. Unverified
+  direct builds report `unknown`; source hashes do not attest a deployed binary.
+- Target scoring requires supplied measured gas temperature and absolute pressure.
+  Without them, peaks remain recorded and targets are unscored.
+- Physical USB behavior, timing, calibration and qualification yield remain
+  unverified. Keep the overall plan BLOCKED until actual rig evidence closes
+  [the hardware procedure](../docs/hardware-validation.md).

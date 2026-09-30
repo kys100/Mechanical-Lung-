@@ -1,6 +1,6 @@
 # Plan 001: Make motion control, acquisition, and peak qualification auditable
 
-> **Executor instructions:** This is a planning deliverable, not an implemented fix. Read the entire plan before changing code. Execute stages in order, preserve their verification gates, and update the stage table in `plans/README.md`. Do not mark a hardware-dependent stage DONE based on simulated tests. No audit report or prior conversation is required to follow this document.
+> **Executor instructions:** This document preserves the implementation specification. Software execution is complete through `e17d7ed`; see the status and evidence in `plans/README.md`. Required physical validation remains blocked. Read the entire plan before further changes and preserve its verification gates. Do not mark a hardware-dependent stage DONE based on simulated tests. No audit report or prior conversation is required to follow this document.
 >
 > **Drift check — run first from repository root:**
 > ```bash
@@ -19,6 +19,11 @@
 - **Category:** bug, tests, performance, measurement integrity, DX, docs.
 - **Planned at:** commit `976bd8a` / `976bd8a58cb3400d102cf829f8c747d2042a12aa`, 2026-09-30.
 - **Selection:** user requested a plan for the preceding complete audit, including F01–F15 and A01–A07. This is the skill's `plan <description>` workflow; no new broad audit or second finding-selection round is needed.
+
+- **Execution:** software DONE at `e17d7edecc9f34595b65852d63bc6b712d0ddb42`; overall BLOCKED on physical rig validation only.
+- **Verification:** 63 final Python checks; 21 native scenarios plus an explicit-core metadata check; actual pinned UNO R4 build. Final host checks rerun; unchanged native/build results reused from `806d2bb` after input comparison. See the index for exact commands and evidence.
+- **Review:** CodeRabbit found four issues in its first implementation pass; all were fixed. Full second pass and final incremental pass each found zero issues. Manual review revisions and regression checks also completed.
+- **Publication authorization:** the user explicitly requested implementation and pushing code. Only the assigned task branch is permitted; physical deployment is outside this execution.
 
 ## Why this matters
 
@@ -167,7 +172,7 @@ Set `ARDUINO_CLI=/tmp/mech-audit/arduino-cli` in this sandbox if that verified e
 
 ## Git workflow
 
-The advisor writes only plans; it does not implement, commit or publish. Future implementation should be divided into reviewable stage-sized patches. Use the assigned workspace branch `coderabbit/audit-logger-peak-detector-firmware/51736d42` if publishing is authorized; do not push another ref. No established commit convention was found; descriptive messages such as `Fix watchdog ownership on host restart` are sufficient. No issue/PR publication is part of this plan.
+The initial advisor pass wrote only plans. The user subsequently authorized execution, commits and publication. Implementation was divided into reviewable commits in an isolated executor worktree, with final integration and verification by the reviewer. Use the assigned workspace branch `coderabbit/audit-logger-peak-detector-firmware/51736d42` if publishing is authorized; do not push another ref. No established commit convention was found; descriptive messages such as `Fix watchdog ownership on host restart` are sufficient. No issue/PR publication is part of this plan.
 
 ## Steps
 
@@ -341,16 +346,16 @@ Use new `tests/test_baseline.py` / `tests/helpers.py` as the structural pattern;
 
 ## Done criteria
 
-- [ ] Every F01–F15/A01–A07 row in the index maps to an implemented/tested stage or an explicit hardware-blocked item.
-- [ ] `bash tools/verify.sh` exits 0 with no unexpected/expected failures or skipped software regression cases.
-- [ ] Native harness includes the real sketch and enforces timing/ordering/CRC invariants; it is not a duplicate firmware implementation.
-- [ ] Actual UNO R4 WiFi build uses the pinned documented core and fits the stated RAM budget.
-- [ ] New and legacy protocol/schema tests pass; firmware and logger are released as a compatible pair, with explicit legacy restrictions.
-- [ ] Fresh synthetic recording plus manifest reproduces all deterministic peak fields, statuses, counts and reasons.
-- [ ] Calibration constants/geometry/motion-profile invariants remain unchanged unless a separately approved evidence-based calibration change supersedes this plan.
-- [ ] No source/support edits outside the Scope list; unrelated recordings and user changes remain untouched.
-- [ ] `git diff --check` exits 0; plan index contains exact executed gate commands/outcomes and truthful software/hardware statuses.
-- [ ] Physical checks are either supported by measurements or clearly BLOCKED; overall plan is not marked fully DONE while required hardware work remains outstanding.
+- [x] Every F01–F15/A01–A07 row in the index maps to an implemented/tested stage or an explicit hardware-blocked item.
+- [x] `bash tools/verify.sh` exits 0 with no unexpected/expected failures or skipped software regression cases.
+- [x] Native harness includes the real sketch and enforces timing/ordering/CRC invariants; it is not a duplicate firmware implementation.
+- [x] Actual UNO R4 WiFi build uses the pinned documented core and fits the stated RAM budget.
+- [x] New and legacy protocol/schema tests pass; firmware and logger are released as a compatible pair, with explicit legacy restrictions.
+- [x] Fresh synthetic recording plus manifest reproduces all deterministic peak fields, statuses, counts and reasons.
+- [x] Calibration constants/geometry/motion-profile invariants remain unchanged unless a separately approved evidence-based calibration change supersedes this plan.
+- [x] No source/support edits outside the Scope list; unrelated recordings and user changes remain untouched.
+- [x] `git diff --check` exits 0; plan index contains exact executed gate commands/outcomes and truthful software/hardware statuses.
+- [x] Physical checks are either supported by measurements or clearly BLOCKED; overall plan is not marked fully DONE while required hardware work remains outstanding.
 
 ## STOP conditions
 
