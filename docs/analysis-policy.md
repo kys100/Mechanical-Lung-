@@ -7,11 +7,14 @@ The final manifest is atomically replaced only after stream flush/close attempts
 Storage/analysis/format/transport failures retain partial files and disable owned
 heartbeats. A failed allocation prevents START. Explicit p discards only the
 stopped session's paths. H preserves them. Unexpected reader failures retain a
-traceback; normal close drains confirmation before stopping the reader. Continuity
-boundaries use the same detector callback error handling as ordinary samples:
-peak writer OSError is a storage fault, serialization failure is a format fault,
-and a detector failure is an analysis fault. Failed detectors are detached before
-teardown so their callback is not retried.
+traceback; normal close drains confirmation before stopping the reader. Peak operations return events. Storage and format errors are classified by the
+recorder; analysis errors are classified at its analysis boundary. Failed recording
+work is not retried during teardown, and detector statistics remain available.
+Transport processes input and heartbeats independently of the bounded recording
+worker. Queue overflow or latency above 1.5 seconds marks ownership unhealthy and
+stops heartbeats. Accepted rows stay ordered ahead of ENDED finalization. A fault
+arriving during final publication is applied before completion is signalled.
+An explicit discard is deferred until the recording owner has closed its files.
 
 Each accepted row must match the acknowledged ID and preset. STARTED resets
 analysis and plot histories. Reset or another active identity interrupts the
@@ -60,7 +63,7 @@ Raw schema 2 has named Sample fields plus the original wire_line; list-valued
 columns are compact JSON. It includes the segmentation mean, all wire acquisition
 fields, unwrapped row/flow/pressure times, segment ID and discontinuity reason.
 Peak schema 2 serializes deterministic event fields (including pressure vectors
-and reasons); exact column arrays are SAMPLE_COLUMNS/PEAK_COLUMNS in the logger.
+and reasons); exact column arrays are SAMPLE_COLUMNS/PEAK_COLUMNS in recording_schema.py.
 Float scalars use 12 significant digits. Manifest boundaries preserve non-row
 errors that otherwise disappear from raw CSV. The manifest includes complete
 resolved config, firmware metadata, software hashes, flow conditions, start/end

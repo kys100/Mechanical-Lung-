@@ -1,3 +1,6 @@
+import serial_link as transport
+import recording_schema as schema
+import recording as storage
 import importlib.machinery
 import importlib.util
 from pathlib import Path
@@ -20,8 +23,10 @@ class FakeSerial:
     def readline(self): return b''
 
 def link(**kwargs):
-    with patch.object(logger.serial, 'Serial', FakeSerial), patch.object(logger.threading.Thread, 'start'):
-        return logger.SerialLink('fake', 115200, 1, **kwargs)
+    kwargs.setdefault('avg_window', 1)
+    kwargs.setdefault('start_reader', False)
+    kwargs.setdefault('background_recording', False)
+    return transport.SerialLink('fake', 115200, serial_instance=FakeSerial(), **kwargs)
 
 RID = '0123456789abcdef'
 def wire(seq=0, flow=0, phase=0, preset=0, run_id=RID, flow_ok=1,
@@ -36,7 +41,7 @@ def wire(seq=0, flow=0, phase=0, preset=0, run_id=RID, flow_ok=1,
 def ready(s):
     s._handle_marker('# PROTOCOL,2')
     s._handle_marker('# META_BEGIN,2,test')
-    for key in sorted(logger.META_KEYS):
+    for key in sorted(schema.META_KEYS):
         s._handle_marker(f'# META,2,{key},test')
     s._handle_marker('# META_END,2,test')
     s._handle_marker('# READY_QUERY')
@@ -49,8 +54,8 @@ class FakeTimer:
 def recording(s, directory):
     ready(s)
     s.run_id=RID; s.mode='P0'; s.state='STARTING'
-    with patch.object(logger, 'RECORDINGS_DIR', directory):
+    with patch.object(storage, 'RECORDINGS_DIR', directory):
         paths=s.start_recording(0)
-    with patch.object(logger.threading, 'Timer', FakeTimer):
+    with patch.object(transport.threading, 'Timer', FakeTimer):
         s._handle_marker(f'# STARTED,2,{RID},P0,1000,1000000')
     return paths

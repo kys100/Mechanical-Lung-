@@ -46,7 +46,7 @@ dac_half_range, dac_corr_offset, dac_corr_gain, pot_raw_centre, pot_dac_per_adc,
 calibration_target, slot_us, sfm_scale, flow_reference. Keys/values are ASCII
 alphanumeric tokens plus `.`, `_`, `+`, `-`; commas/newlines are forbidden.
 Missing/duplicate keys and mismatched build IDs prevent readiness. The build
-script supplies the source SHA256 as MECH_BUILD_ID and supplies MECH_CORE_ID only
+script hashes the sketch and acquisition/telemetry headers for MECH_BUILD_ID and supplies MECH_CORE_ID only
 after verifying installed core 1.6.0. Unverified builds (including direct IDE
 builds) report `unknown` for both identities unless explicitly supplied; source
 identity does not prove a flashed binary identity. Constants

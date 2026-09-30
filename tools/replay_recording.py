@@ -6,28 +6,19 @@ half the least printed unit plus floating point rounding; strings, statuses,
 reason lists, vector lengths and event counts must match exactly.
 """
 import argparse
-import contextlib
 import csv
-import importlib.machinery
-import importlib.util
-import io
 import json
 import math
+import re
+from dataclasses import asdict
 from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-loader = importlib.machinery.SourceFileLoader('replay_logger', str(ROOT/'Data_Logger.txt'))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-logger = importlib.util.module_from_spec(spec)
-loader.exec_module(logger)
-
-class OfflineSerial:
-    def write(self, data):
-        raise RuntimeError('replay must never send serial data')
-    def close(self):
-        pass
+import recording_schema as schema
+from analysis import AnalysisSession
+from peak_detection import PeakDetectionConfig
 
 
 def numeric_equal(a, b):
@@ -66,71 +57,63 @@ def replay(session, samples, compare_peaks):
                 'flow_reference', 'boundaries', 'software_hashes', 'firmware', 'expected_expiration_sign')
     if any(key not in manifest for key in required) or not manifest['start_ack'] or not manifest['firmware']:
         raise ValueError('missing replay provenance')
-    if set(manifest['detector_config']) != set(logger.asdict(logger.PeakDetectionConfig())):
+    if set(manifest['detector_config']) != set(asdict(PeakDetectionConfig())):
         raise ValueError('incomplete detector configuration')
-    if set(manifest['firmware']) != logger.META_KEYS | {'build_id'}:
+    if set(manifest['firmware']) != schema.META_KEYS | {'build_id'}:
         raise ValueError('incomplete firmware metadata')
     if set(manifest['flow_reference']) != {'gas_temperature_c', 'absolute_pressure_mbar'}:
         raise ValueError('incomplete flow reference')
-    if set(manifest['software_hashes']) != {'Data_Logger.txt', 'peak_detection.py'}:
+    if set(manifest['software_hashes']) not in ({'Data_Logger.txt', 'peak_detection.py'}, set(schema.SOFTWARE_FILES)):
         raise ValueError('incomplete software hashes')
-    if any(not logger.re.fullmatch('[0-9a-f]{64}', value) for value in manifest['software_hashes'].values()):
+    if any(not re.fullmatch('[0-9a-f]{64}', value) for value in manifest['software_hashes'].values()):
         raise ValueError('invalid software hash')
     if not isinstance(manifest['avg_window'], int) or isinstance(manifest['avg_window'], bool) or manifest['avg_window'] < 1:
         raise ValueError('invalid average window')
-    if manifest.get('config_sha256') != logger.config_fingerprint(manifest):
+    if manifest.get('config_sha256') != schema.config_fingerprint(manifest):
         raise ValueError('configuration fingerprint mismatch')
-    link = logger.SerialLink(None, 115200, manifest['avg_window'],
-                             peak_config=logger.PeakDetectionConfig(**manifest['detector_config']),
-                             expected_expiration_sign=manifest['expected_expiration_sign'],
-                             serial_instance=OfflineSerial(), start_reader=False,
-                             **manifest['flow_reference'])
-    link.run_id = manifest['run_id']
-    link.mode = manifest['mode']
-    link.state = 'RUNNING'
-    link._record_started = True
-    link._record_expected_preset = manifest['preset']
-    link._reset_analysis_state(manifest['start_ack']['millis'], manifest['start_ack']['micros'])
+    analysis = AnalysisSession(manifest['avg_window'],
+                               PeakDetectionConfig(**manifest['detector_config']),
+                               **manifest['flow_reference'])
+    analysis.reset(manifest['start_ack']['millis'], manifest['start_ack']['micros'])
     events = []
-    detector = logger.PeakFlowDetector(link.peak_config, lambda ev: events.append(logger.event_record(ev)))
-    link._detector = detector
     # Only non-row boundaries need explicit injection. Row loss/invalidity
     # transitions are re-derived from wire values by the same live parser.
     boundaries = [b for b in manifest['boundaries'] if b['before_seq'] is None]
     boundary_index = 0
     with open(samples, newline='') as stream:
         reader = csv.DictReader(stream)
-        if reader.fieldnames != logger.SAMPLE_COLUMNS:
+        if reader.fieldnames != schema.SAMPLE_COLUMNS:
             raise ValueError('sample columns do not match schema 2')
         for row in reader:
-            while boundary_index < len(boundaries) and boundaries[boundary_index]['after_seq'] == link._last_seq:
-                link._break_locked(boundaries[boundary_index]['reason'])
+            while boundary_index < len(boundaries) and boundaries[boundary_index]['after_seq'] == analysis.last_seq:
+                events.extend(schema.event_record(ev) for ev in analysis.break_continuity(boundaries[boundary_index]['reason']))
                 boundary_index += 1
-            parsed = logger.parse_wire(row['wire_line'])
-            if parsed['protocol'] != 2 or parsed['run_id'] != link.run_id or parsed['preset'] != manifest['preset']:
+            parsed = schema.parse_wire(row['wire_line'])
+            if parsed['protocol'] != 2 or parsed['run_id'] != manifest['run_id'] or parsed['preset'] != manifest['preset']:
                 raise ValueError('sample belongs to another session')
-            sample = link._sample_from_wire(parsed, True)
+            result = analysis.push(parsed)
+            sample = result.sample
             # Verify segmentation history and per-sensor timing, not host receipt.
-            computed = logger.sample_record(sample, row['wire_line'])
-            for key in logger.SAMPLE_COLUMNS:
+            computed = schema.sample_record(sample, row['wire_line'])
+            for key in schema.SAMPLE_COLUMNS:
                 if key != 'host_unix' and not cell_equal(computed[key], row[key]):
                     raise ValueError(f'sample {sample.seq} mismatch: {key}')
-            detector.push(sample)
-    while boundary_index < len(boundaries) and boundaries[boundary_index]['after_seq'] == link._last_seq:
-        link._break_locked(boundaries[boundary_index]['reason'])
+            events.extend(schema.event_record(ev) for ev in result.events)
+    while boundary_index < len(boundaries) and boundaries[boundary_index]['after_seq'] == analysis.last_seq:
+        events.extend(schema.event_record(ev) for ev in analysis.break_continuity(boundaries[boundary_index]['reason']))
         boundary_index += 1
     if boundary_index != len(boundaries):
         raise ValueError('unreplayable discontinuity boundary')
-    detector.flush()
+    events.extend(schema.event_record(ev) for ev in analysis.finish())
     with open(compare_peaks, newline='') as stream:
         reader = csv.DictReader(stream)
-        if reader.fieldnames != logger.PEAK_COLUMNS:
+        if reader.fieldnames != schema.PEAK_COLUMNS:
             raise ValueError('peak columns do not match schema 2')
         saved = list(reader)
     if len(events) != len(saved):
         raise ValueError(f'event count differs: replay {len(events)} / saved {len(saved)}')
     for i, (actual, expected) in enumerate(zip(events, saved)):
-        for key in logger.PEAK_COLUMNS:
+        for key in schema.PEAK_COLUMNS:
             if not cell_equal(actual[key], expected[key]):
                 raise ValueError(f'peak {i+1} mismatch: {key}')
     return events

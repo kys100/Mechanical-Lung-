@@ -1,3 +1,5 @@
+import serial_link as transport
+import recording as storage
 import csv
 import json
 from pathlib import Path
@@ -41,16 +43,16 @@ class Release(unittest.TestCase):
                     s.feed_bytes(prefix.encode())
                     self.assertEqual(s.protocol_version,2);self.assertIsNotNone(s.metadata)
                     s.run_id=RID;s.mode='P0';s.state='STARTING'
-                    with patch.object(logger,'RECORDINGS_DIR',d):paths=s.start_recording(0)
+                    with patch.object(storage,'RECORDINGS_DIR',d):paths=s.start_recording(0)
                     session=tail
                     if lose_row:
                         rows=session.splitlines()
                         rows=[('DATA2,malformed' if r.startswith('DATA2,140,') else r) for r in rows]
                         session='\n'.join(rows)+'\n'
-                    with patch.object(logger.threading,'Timer',FakeTimer):
+                    with patch.object(transport.threading,'Timer',FakeTimer):
                         for offset in range(0,len(session),73):s.feed_bytes(session[offset:offset+73].encode())
                     self.assertEqual(s.state,'IDLE')
-                    self.assertEqual(s.manifest['complete'],not lose_row)
+                    self.assertEqual(s.recording.manifest['complete'],not lose_row)
                     with open(paths[1]) as f:peaks=list(csv.DictReader(f))
                     self.assertTrue(peaks)
                     if lose_row:self.assertEqual(peaks[0]['excursion_complete'],'0')

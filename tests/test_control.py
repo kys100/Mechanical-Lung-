@@ -1,3 +1,6 @@
+import serial_link as transport
+import recording_schema as schema
+import recording as storage
 import contextlib
 import io
 import tempfile
@@ -38,7 +41,7 @@ class Control(unittest.TestCase):
                     reader.start()
                 return result
             s.ser.write=write
-            with patch.object(logger,'RECORDINGS_DIR',d),patch.object(logger.threading,'Timer',FakeTimer):
+            with patch.object(storage,'RECORDINGS_DIR',d),patch.object(transport.threading,'Timer',FakeTimer):
                 self.assertTrue(s.begin_timed_run(0,'1'))
             self.assertEqual(s.state,'RUNNING')
             s._fault('test_end')
@@ -67,7 +70,7 @@ class Control(unittest.TestCase):
                 s._handle_data_line(wire())
                 s._handle_marker(f'# ENDED,2,{RID},0,host_stop,0')
             event=CallbackEvent(ack);s._ended_event=event
-            self.assertTrue(s.stop_run());self.assertTrue(s.manifest['complete'])
+            self.assertTrue(s.stop_run());self.assertTrue(s.recording.manifest['complete'])
             s._on_run_timeout(old);self.assertEqual(s.state,'IDLE')
     def test_stale_stopper_cannot_fault_new_run(self):
         with tempfile.TemporaryDirectory() as d:
@@ -154,7 +157,7 @@ class Control(unittest.TestCase):
                     def write_timeout(self,value):
                         self.assignments=getattr(self,'assignments',0)+1
                         if self.assignments==(3 if restore else 2):
-                            raise logger.serial.SerialException('timeout property failed')
+                            raise transport.serial.SerialException('timeout property failed')
                         self._timeout=value
                 s.ser=TimeoutFaultSerial()
                 self.assertFalse(s.stop_run())
@@ -175,8 +178,8 @@ class Control(unittest.TestCase):
             s.ser.write=lambda data:0
             self.assertFalse(s.send_command('m'))
             self.assertEqual(s.state,'FAULTED')
-            self.assertEqual(s.manifest['termination_reason'],'transport_fault')
-            self.assertIsNone(s._record_file);self.assertFalse(s._heartbeat_enabled)
+            self.assertEqual(s.recording.manifest['termination_reason'],'transport_fault')
+            self.assertIsNone(s.recording._record_file);self.assertFalse(s._heartbeat_enabled)
     def test_complete_fresh_handshake_restores_connection_status(self):
         with tempfile.TemporaryDirectory() as d:
             s=link();recording(s,d)
@@ -192,7 +195,7 @@ class Control(unittest.TestCase):
             self.assertEqual(s.state,'FAULTED');self.assertFalse(s.connected)
             s._handle_marker('# PROTOCOL,2')
             s._handle_marker('# META_BEGIN,2,reconnected')
-            for key in sorted(logger.META_KEYS):
+            for key in sorted(schema.META_KEYS):
                 s._handle_marker(f'# META,2,{key},test')
             s._handle_marker('# READY_QUERY')
             self.assertEqual(s.state,'FAULTED');self.assertFalse(s.connected)

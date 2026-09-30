@@ -3,6 +3,8 @@
 import math
 from dataclasses import dataclass
 from numbers import Integral
+from typing import TypedDict, Optional
+from recording_schema import Sample
 
 
 DEFAULT_PEAK_TOLERANCE_PCT = 10.0
@@ -133,10 +135,65 @@ def interpolate_peak(times, values):
     return dt, y0 + b*dt + a*dt*dt, 'interpolated'
 
 
+def continuity_reason(previous, *, seq, scan_id, t_s, run_id,
+                      missed_slots_total, tx_dropped_total, flow_ok, max_gap_us):
+    """One continuity policy for normalization and standalone detection."""
+    if not flow_ok:
+        return 'invalid_flow'
+    if previous is None:
+        return None
+    if (seq - previous.seq) & 0xffffffff != 1:
+        return 'sequence_discontinuity'
+    if scan_id is not None and previous.scan_id is not None and (scan_id - previous.scan_id) & 0xffffffff != 1:
+        return 'scan_discontinuity'
+    if not 0 < (t_s - previous.t_s) * 1e6 <= max_gap_us:
+        return 'flow_time_discontinuity'
+    if run_id != previous.run_id:
+        return 'run_discontinuity'
+    if missed_slots_total != previous.missed_slots_total or tx_dropped_total != previous.tx_dropped_total:
+        return 'firmware_loss'
+    return None
+
+
+class PeakEvent(TypedDict):
+    peak_idx: int
+    sample: Sample
+    direction: int
+    flow_peak_slm: float
+    plateau_reference_flow_slm: float
+    peak_time_s: float
+    peak_offset_s: float
+    interpolation_status: str
+    nearest_sample_seq: int
+    target_peak_slm: float
+    target_error_slm: float
+    target_error_pct: float
+    target_met: Optional[bool]
+    is_warmup: bool
+    excursion_complete: bool
+    pa_mean: list[float]
+    pa_std: list[float]
+    pa_ok_frac: list[float]
+    pressure_all_ok: bool
+    timing_ok: bool
+    peak_sample_ok: bool
+    plateau_capture_ok: bool
+    qualified_peak: Optional[bool]
+    reason_codes: list[str]
+    plateau_n: int
+    plateau_contiguous: bool
+    max_pressure_age_us: int
+    pressure_age_span_us: int
+    flow_pressure_skew_us: int
+    plateau_span_s: float
+    excursion_n: int
+    excursion_s: float
+
+
 class PeakFlowDetector:
     """Baseline-armed, continuity-aware excursion analysis (policy version 2)."""
-    def __init__(self, config, on_peak):
-        self.config, self.on_peak = config, on_peak
+    def __init__(self, config):
+        self.config = config
         self._buf = []
         self._sign = 0
         self._armed = False
@@ -150,59 +207,51 @@ class PeakFlowDetector:
         self.qualified_peaks = self.unqualified_peaks = 0
         self.discard_reasons = {}
 
-    def break_continuity(self, reason):
+    def break_continuity(self, reason) -> list[PeakEvent]:
         self._break_reason = reason
-        if self._buf:
-            self._close(False)
+        events = self._close(False) if self._buf else []
         self._armed = False
         self._previous = None
+        return events
 
-    def push(self, sample):
+    def push(self, sample: Sample, *, check_continuity=True) -> list[PeakEvent]:
         if not sample.flow_ok or not all(math.isfinite(v) for v in (sample.flow_raw, sample.flow_avg, sample.t_s)):
-            self.break_continuity('invalid_flow')
-            return
-        previous = self._previous
-        if previous is not None:
-            reason = None
-            if (sample.seq-previous.seq) & 0xffffffff != 1:
-                reason = 'sequence_discontinuity'
-            elif sample.scan_id is not None and previous.scan_id is not None and (sample.scan_id-previous.scan_id) & 0xffffffff != 1:
-                reason = 'scan_discontinuity'
-            elif not 0 < (sample.t_s-previous.t_s)*1e6 <= self.config.max_sample_gap_us:
-                reason = 'flow_time_discontinuity'
-            elif sample.run_id != previous.run_id:
-                reason = 'run_discontinuity'
-            elif sample.missed_slots_total != previous.missed_slots_total or sample.tx_dropped_total != previous.tx_dropped_total:
-                reason = 'firmware_loss'
+            return self.break_continuity('invalid_flow')
+        events = []
+        if check_continuity:
+            reason = continuity_reason(self._previous, seq=sample.seq, scan_id=sample.scan_id,
+                                       t_s=sample.t_s, run_id=sample.run_id,
+                                       missed_slots_total=sample.missed_slots_total,
+                                       tx_dropped_total=sample.tx_dropped_total,
+                                       flow_ok=sample.flow_ok, max_gap_us=self.config.max_sample_gap_us)
             if reason:
-                self.break_continuity(reason)
+                events.extend(self.break_continuity(reason))
         self._previous = sample
         threshold = self.config.opening_threshold(sample.target_peak_slm)
         exit_level = self._exit if self._exit is not None else threshold*self.config.exit_frac
         baseline = abs(sample.flow_raw) < exit_level and abs(sample.flow_avg) < exit_level
         if baseline:
             if self._buf:
-                self._close(True)
+                events.extend(self._close(True))
             self._armed = True
             self._exit = None
             self._break_reason = None
-            return
-        if self._buf:
+        elif self._buf:
             first = self._buf[0]
             if sample.phase != first.phase or sample.cycle_id != first.cycle_id:
-                self.break_continuity('phase_cycle_discontinuity')
-                return
-            if self._sign * sample.flow_avg <= 0:
-                self.break_continuity('sign_reversal_without_baseline')
-                return
-            self._buf.append(sample)
+                events.extend(self.break_continuity('phase_cycle_discontinuity'))
+            elif self._sign * sample.flow_avg <= 0:
+                events.extend(self.break_continuity('sign_reversal_without_baseline'))
+            else:
+                self._buf.append(sample)
         elif self._armed and abs(sample.flow_avg) >= threshold:
             self._sign = 1 if sample.flow_avg > 0 else -1
             self._exit = threshold*self.config.exit_frac
             self._buf = [sample]
+        return events
 
-    def flush(self):
-        self.break_continuity('session_end')
+    def flush(self) -> list[PeakEvent]:
+        return self.break_continuity('session_end')
 
     def _close(self, complete):
         samples, sign = self._buf, self._sign
@@ -210,7 +259,7 @@ class PeakFlowDetector:
         if len(samples) < self.config.min_samples:
             self.discarded += 1
             self.discard_reasons['insufficient_support'] = self.discard_reasons.get('insufficient_support', 0)+1
-            return
+            return []
         smooth = centred_moving_average([s.flow_raw for s in samples], self.config.smooth_window)
         supported = [i for i, v in enumerate(smooth) if math.isfinite(v)]
         peak_index = max(supported, key=lambda i: sign*smooth[i])
@@ -266,7 +315,7 @@ class PeakFlowDetector:
             self.timing_failures += not all(timing_ok(s) for s in plateau)
         ages = [a for ok,a in zip(peak_sample.pok,peak_sample.pa_age_us) if ok and a>=0]
         self.count += 1
-        self.on_peak(dict(
+        return [PeakEvent(
             peak_idx=self.count, sample=peak_sample, direction=sign,
             flow_peak_slm=sign*magnitude, plateau_reference_flow_slm=sign*reference,
             peak_time_s=peak_sample.t_s+dt, peak_offset_s=dt,
@@ -282,4 +331,4 @@ class PeakFlowDetector:
             pressure_age_span_us=max(ages)-min(ages) if ages else -1,
             flow_pressure_skew_us=max(abs(a-peak_sample.flow_age_us) for a in ages) if ages else -1,
             plateau_span_s=plateau[-1].t_s-plateau[0].t_s if plateau else 0,
-            excursion_n=len(samples),excursion_s=samples[-1].t_s-samples[0].t_s))
+            excursion_n=len(samples),excursion_s=samples[-1].t_s-samples[0].t_s)]

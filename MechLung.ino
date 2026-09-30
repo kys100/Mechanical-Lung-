@@ -388,16 +388,6 @@ static bool initPsensChannel(uint8_t channel) {
 }
 
 // Mean temperature across whichever channels succeeded this cycle.
-static float averagePsensTemp(int success_count) {
-  if (success_count == 0) return 0.0f;
-
-  float sum = 0.0f;
-  for (uint8_t ch = 0; ch < NUM_PSENS; ch++) {
-    if (psens[ch].ok) sum += psens[ch].temp_c;
-  }
-  return sum / (float)success_count;
-}
-
 // =============================================================================
 //  DAC REGISTER BOUND — NOT A TRAVEL-SAFETY LIMIT
 // =============================================================================
@@ -704,19 +694,13 @@ static bool completedId(const char *id) {
 }
 static char ended_marker[128] = "", started_marker[128] = "";
 static int64_t final_enqueued_seq = -1;
-static bool scan_active = false;
-static uint8_t scan_ch = 0, scan_done = 0, rotation = 0, sensor_step = 0;
-static uint32_t scan_start_us = 0;
-static int scan_phase = -1, scan_preset = -1, scan_dac = 0;
-static uint32_t scan_cycle = 0;
-static float scan_target = 0, scan_peak = 0, scan_feedback = 0;
-static void closeScan();
+#include "acquisition.h"
 static void startMotion(int preset) {
   current_preset = preset;
   phi_us = 0;
   seq = scan_id = cycle_id = missed_slots_total = 0;
   actuator_clamped = false;
-  scan_active = false;
+  scanner.active = false;
   final_enqueued_seq = -1;
   tx_dropped_total = 0;
   slot_us = phase_update_us = last_dac_us = micros();
@@ -734,7 +718,7 @@ static void startDemoSine() {
 static void goIdleHold() {
   current_preset = -1;
   host_watchdog_armed = false;
-  scan_active = false;
+  scanner.active = false;
   resetPositionFeedback();
   holdCentre();
 }
@@ -932,135 +916,6 @@ static void handleSerial() {
     }
   }
 }
-// Each pass is SELECT or a single sensor READ/STOP/START. A slot timeout
-// abandons the old scan; rotation prevents later mux channels starving.
-static void serviceSensors() {
-  if (!scan_active) return;
-  if (sensor_step == 0) {
-    sfm3000Service(micros());
-    sensor_step = 1;
-    return;
-  }
-  SdpSensor &s = psens[scan_ch];
-  if (sensor_step == 1) {
-    if (s.recovery_state != SDP_RECOVERY_IDLE && !timeReachedUs(micros(), s.recovery_due_us)) {
-      sensor_step = 3;
-    } else if (!muxSelect(scan_ch)) {
-      if (++s.consecutive_fails >= CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
-        s.consecutive_fails = 0;
-        s.recovery_state = SDP_RECOVERY_RETRY_WAIT;
-        s.recovery_due_us = micros() + SDP_RECOVERY_RETRY_US;
-      }
-      sensor_step = 3;
-    } else
-      sensor_step = 2;
-    return;
-  }
-  if (sensor_step == 2) {
-    if (s.recovery_state == SDP_RECOVERY_RETRY_WAIT) {
-      sdpStop();
-      ++s.reinit_count;
-      s.recovery_state = SDP_RECOVERY_WAIT_START;
-      s.recovery_due_us = micros() + 1000;
-    } else if (s.recovery_state == SDP_RECOVERY_WAIT_START) {
-      const bool started = sdpStart();
-      s.recovery_state = started ? SDP_RECOVERY_WAIT_READY : SDP_RECOVERY_RETRY_WAIT;
-      s.recovery_due_us = micros() + (started ? 25000 : SDP_RECOVERY_RETRY_US);
-    } else {
-      s.recovery_state = SDP_RECOVERY_IDLE;
-      s.ok = sdpRead(s.pressure_pa, s.temp_c);
-      if (s.ok) {
-        s.sample_us = micros();
-        s.consecutive_fails = 0;
-      } else if (++s.consecutive_fails >= CONSECUTIVE_FAIL_REINIT_THRESHOLD) {
-        s.consecutive_fails = 0;
-        s.recovery_state = SDP_RECOVERY_RETRY_WAIT;
-        s.recovery_due_us = micros();
-      }
-    }
-    sensor_step = 3;
-    return;
-  }
-  ++scan_done;
-  scan_ch = (scan_ch + 1) % NUM_PSENS;
-  sensor_step = 1;
-  if (scan_done == NUM_PSENS) closeScan();
-}
-// Check each append before advancing the cursor; truncated snprintf lengths
-// must never become out-of-bounds pointer arithmetic on the next append.
-static bool appendField(size_t &used, const char *format, ...) {
-  if (used >= TX_SIZE) return false;
-  va_list args;
-  va_start(args, format);
-  const int n = vsnprintf(format_buffer + used, TX_SIZE - used, format, args);
-  va_end(args);
-  if (n < 0 || (size_t)n >= TX_SIZE - used) return false;
-  used += n;
-  return true;
-}
-static void closeScan() {
-  if (!scan_active) return;
-  scan_active = false;
-  const uint32_t row_us = micros();
-  if (scan_preset >= 0) {
-    int closure_phase;
-    float closure_peak;
-    const float total = phi_us + (float)(uint32_t)(row_us - phase_update_us);
-    const float period = presets[scan_preset].period_us;
-    commandedFlowSlm(fmodf(total, period), closure_phase, closure_peak);
-    if (closure_phase != scan_phase || total >= period) {
-      // No extra wire flag is needed: invalidate a mixed-phase snapshot.
-      flow_sensor_ok = false;
-      for (auto &sensor : psens) sensor.ok = false;
-    }
-  }
-  size_t used = 0;
-  bool fits = appendField(used, "%s,%lu,%lu,%.3f,%d,%ld,", run_id[0] ? "DATA2" : "DATA",
-                          (unsigned long)seq, (unsigned long)millis(), flow_slm, flow_sensor_ok,
-                          (long)sampleAgeUs(row_us, flow_sensor_ok, flow_sample_us));
-  int ok_count = 0;
-  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch) {
-    fits = fits && appendField(used, "%.3f,", psens[ch].pressure_pa);
-    ok_count += psens[ch].ok;
-  }
-  fits = fits && appendField(used, "%.2f,", averagePsensTemp(ok_count));
-  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch) fits = fits && appendField(used, "%d,", psens[ch].ok);
-  for (uint8_t ch = 0; ch < NUM_PSENS; ++ch)
-    fits = fits &&
-           appendField(used, "%ld,", (long)sampleAgeUs(row_us, psens[ch].ok, psens[ch].sample_us));
-  fits = fits && appendField(used, "%d,%.2f,%.2f,%.2f,%.3f,%.3f,%d,%d,%d", scan_dac, scan_feedback,
-                             100.0f * (scan_dac - corrected_centre_dac) / DAC_HALF_RANGE,
-                             100.0f * (scan_feedback - corrected_centre_dac) / DAC_HALF_RANGE,
-                             scan_target, scan_peak, scan_phase, scan_preset, actuator_clamped);
-  if (run_id[0])
-    fits = fits && appendField(used, ",%s,%lu,%lu,%lu,%lu,%lu,%lu", run_id, (unsigned long)scan_id,
-                               (unsigned long)row_us, (unsigned long)scan_cycle,
-                               (unsigned long)scan_start_us, (unsigned long)missed_slots_total,
-                               (unsigned long)tx_dropped_total);
-  fits = fits && appendField(used, "\n");
-  if (fits) {
-    if (enqueueText(format_buffer, false, true)) final_enqueued_seq = seq;
-  } else {
-    ++tx_dropped_total;
-  }
-  ++seq;
-}
-static void startScan(uint32_t now) {
-  scan_active = true;
-  ++scan_id;
-  scan_start_us = now;
-  scan_done = 0;
-  sensor_step = 0;
-  scan_ch = rotation;
-  rotation = (rotation + 1) % NUM_PSENS;
-  flow_sensor_ok = false;
-  for (auto &s : psens) s.ok = false;
-  scan_cycle = cycle_id;
-  scan_preset = current_preset;
-  scan_dac = last_dac_out;
-  scan_feedback = last_feedback_dac;
-  scan_target = commandedFlowSlm(phi_us, scan_phase, scan_peak);
-}
 void setup() {
   // Centre precedes USB diagnostics and all I2C initialization.
   initPresets();
@@ -1101,7 +956,7 @@ void loop() {
     const uint32_t slots = elapsed / LOG_INTERVAL_US;
     slot_us += slots * LOG_INTERVAL_US;
     missed_slots_total += slots - 1;
-    if (scan_active) closeScan();
+    if (scanner.active) closeScan();
     if (current_preset != -1) {
       const float period =
           current_preset == -2 ? DEMO_SINE_PERIOD_US : presets[current_preset].period_us;

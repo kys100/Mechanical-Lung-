@@ -1,3 +1,4 @@
+import recording as storage
 import csv
 import json
 import math
@@ -13,14 +14,14 @@ class Provenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             for suffix in ('.csv','_peaks.csv','_session.json'):
                 base='run'+str(len(suffix)); existing=Path(d,base+suffix);existing.write_text('keep')
-                paths,files=logger.open_unique_session(d,base)
+                paths,files=storage.open_unique_session(d,base)
                 self.assertNotEqual(paths[0],str(Path(d,base+'.csv')))
                 for f in files:f.close()
                 self.assertEqual(existing.read_text(),'keep')
     def test_replay_and_config_drift(self):
         with tempfile.TemporaryDirectory() as d:
             s=link(gas_temperature_c=20,absolute_pressure_mbar=1013)
-            s.avg_window=3;s._flow_hist=logger.deque(maxlen=3)
+            s.recording.analysis.avg_window=3;s.recording.analysis._flow_hist=logger.deque(maxlen=3)
             paths=recording(s,d)
             for i in range(410):
                 j=i%205;f=10*math.sin(math.pi*j/200) if j<=200 else 0
@@ -38,7 +39,7 @@ class Provenance(unittest.TestCase):
     def test_preexisting_temporary_preserved(self):
         with tempfile.TemporaryDirectory() as d:
             s=link();paths=recording(s,d);tmp=Path(paths[2]+'.tmp');tmp.write_text('keep')
-            with self.assertRaises(FileExistsError):s._save_manifest()
+            with self.assertRaises(FileExistsError):s.recording._save_manifest()
             self.assertEqual(tmp.read_text(),'keep');tmp.unlink();s._fault('test_end')
     def test_manifest_failure_retains_incomplete_original(self):
         with tempfile.TemporaryDirectory() as d:
@@ -68,17 +69,17 @@ class Provenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             s=link();from helpers import ready
             ready(s)
-            with patch.object(logger,'RECORDINGS_DIR',d),patch.object(logger.os,'replace',side_effect=OSError('disk failure')):
+            with patch.object(storage,'RECORDINGS_DIR',d),patch.object(logger.os,'replace',side_effect=OSError('disk failure')):
                 self.assertFalse(s.begin_timed_run(0,'1'))
             self.assertEqual(s.state,'IDLE');self.assertFalse(s.ser.writes)
-            self.assertIsNone(s._record_file);self.assertIsNone(s._peak_file)
+            self.assertIsNone(s.recording._record_file);self.assertIsNone(s.recording._peak_file)
     def test_initial_manifest_and_first_close_failure_clean_every_stream(self):
         import contextlib
         import io
         from helpers import ready
         with tempfile.TemporaryDirectory() as d:
             s=link();ready(s)
-            allocate=logger.open_unique_session
+            allocate=storage.open_unique_session
             owned=[]
             close_attempts=[]
             def reserve(directory,base):
@@ -93,17 +94,17 @@ class Provenance(unittest.TestCase):
                         if self.index==0:raise OSError('sample close also failed')
                 return paths,[Stream(i) for i in range(3)]
             output=io.StringIO()
-            with patch.object(logger,'RECORDINGS_DIR',d), \
-                    patch.object(logger,'open_unique_session',reserve), \
-                    patch.object(s,'_save_manifest',side_effect=OSError('initial manifest failed')), \
+            with patch.object(storage,'RECORDINGS_DIR',d), \
+                    patch.object(storage,'open_unique_session',reserve), \
+                    patch.object(s.recording,'_save_manifest',side_effect=OSError('initial manifest failed')), \
                     contextlib.redirect_stdout(output):
                 self.assertFalse(s.begin_timed_run(0,'1'))
             self.assertEqual(s.state,'IDLE');self.assertFalse(s.ser.writes)
-            self.assertFalse(s._heartbeat_enabled);self.assertFalse(s._record_started)
+            self.assertFalse(s._heartbeat_enabled);self.assertFalse(s.recording.started)
             for field in ('_record_file','_peak_file','_record_writer','_peak_writer',
                           '_record_path','_peak_path','_manifest_path',
-                          '_record_expected_preset','_detector','manifest'):
-                self.assertIsNone(getattr(s,field),field)
+                          'manifest'):
+                self.assertIsNone(getattr(s.recording,field),field)
             self.assertTrue(all(stream.closed for stream in owned))
             self.assertEqual(close_attempts,[2,0,1,2])
             self.assertIn('initial manifest failed',output.getvalue())

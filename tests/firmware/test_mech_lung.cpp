@@ -164,14 +164,14 @@ int main(int argc, char **argv) {
     assert(Serial.text.find("host_stop,0\n")!=std::string::npos);
   } else if(name=="recovery_wait") {
     psens[0].recovery_state=SDP_RECOVERY_RETRY_WAIT;
-    scan_active=true;scan_ch=0;sensor_step=1;
-    serviceSensors();assert(sensor_step==2);
+    scanner.active=true;scanner.channel=0;scanner.step=ScanStep::SelectPressure;
+    serviceSensors();assert(scanner.step==ScanStep::ReadPressure);
     const auto before=micros();serviceSensors();
     assert(psens[0].recovery_due_us==before+50+1000);
     assert(transactions.back().channel==0);
     assert(psens[0].recovery_state==SDP_RECOVERY_WAIT_START);
     fake_us=psens[0].recovery_due_us;
-    scan_ch=0;sensor_step=1;serviceSensors();serviceSensors();
+    scanner.channel=0;scanner.step=ScanStep::SelectPressure;serviceSensors();serviceSensors();
     assert(psens[0].recovery_state==SDP_RECOVERY_WAIT_READY);
     assert(psens[0].recovery_due_us==micros()+25000);
     assert(transactions.back().channel==0);
@@ -216,6 +216,28 @@ int main(int argc, char **argv) {
     frame("@STOP,01");
     frame("\nH");
     assert(current_preset==-1 && last_dac_out==corrected_centre_dac);
+  } else if(name=="snapshot_isolation") {
+    frame("@START,0123456789abcdef,P0\n");runFor(25000);
+    while(scanner.active) serviceSensors();
+    while(tx_count) serviceTx();
+    const ScanSnapshot saved = scanner.sample;
+    Serial.text.clear();
+    publishScan(saved);while(tx_count) serviceTx();
+    const std::string expected = Serial.text;
+    for(auto &sensor:psens) { sensor.pressure_pa=-999; sensor.ok=false; }
+    flow_slm=-999;flow_sensor_ok=false;fake_us+=100000;
+    scanner.sample.phase=-1;scanner.sample.flow=0;
+    Serial.text.clear();publishScan(saved);while(tx_count) serviceTx();
+    assert(Serial.text==expected);
+  } else if(name=="partial_and_mixed_scan") {
+    frame("@START,0123456789abcdef,P0\n");
+    startScan(micros());serviceSensors();closeScan();
+    assert(scanner.sample.flow_ok);
+    for(const auto &p:scanner.sample.pressure) assert(!p.ok);
+    phi_us=presets[0].t_exp_us-100;phase_update_us=micros();
+    startScan(micros());serviceSensors();fake_us+=200;closeScan();
+    assert(!scanner.sample.flow_ok);
+    for(const auto &p:scanner.sample.pressure) assert(!p.ok);
   } else if(name=="metadata") {
     frame("?"); runFor(100000);
     assert(Serial.text.find("# META_BEGIN,2,")!=std::string::npos);

@@ -19,40 +19,40 @@ class Protocol(unittest.TestCase):
     def test_tail_and_split_frames(self):
         with tempfile.TemporaryDirectory() as d:
             s=link();paths=recording(s,d)
-            line=(wire()+'\n').encode();s.feed_bytes(line[:16]);self.assertEqual(s._rows_written,0)
-            s.feed_bytes(line[16:]);self.assertEqual(s._rows_written,1)
+            line=(wire()+'\n').encode();s.feed_bytes(line[:16]);self.assertEqual(s.recording.rows,0)
+            s.feed_bytes(line[16:]);self.assertEqual(s.recording.rows,1)
             s.state='STOPPING';s.feed_bytes((wire(1)+'\n').encode())
             s._handle_marker(f'# ENDED,2,{RID},1,host_stop,0')
-            self.assertEqual(s._rows_written,2);self.assertTrue(s.manifest['complete'])
-            s._handle_data_line(wire(2));self.assertEqual(s._rows_written,2)
+            self.assertEqual(s.recording.rows,2);self.assertTrue(s.recording.manifest['complete'])
+            s._handle_data_line(wire(2));self.assertEqual(s.recording.rows,2)
     def test_stale_session_and_final_mismatch(self):
         with tempfile.TemporaryDirectory() as d:
             s=link();recording(s,d);s._handle_data_line(wire(run_id='fedcba9876543210'))
-            self.assertEqual(s.state,'FAULTED');self.assertEqual(s._rows_written,0)
-            self.assertTrue(s.manifest['tail_truncated'])
+            self.assertEqual(s.state,'FAULTED');self.assertEqual(s.recording.rows,0)
+            self.assertTrue(s.recording.manifest['tail_truncated'])
     def test_unknown_schema_boundary(self):
         with tempfile.TemporaryDirectory() as d:
             s=link();recording(s,d);s._handle_data_line('DATA3,0')
-            self.assertEqual(s.manifest['boundaries'][-1]['reason'],'malformed_data')
+            self.assertEqual(s.recording.manifest['boundaries'][-1]['reason'],'malformed_data')
             s._fault('test_end')
     def test_zero_rows_duplicate_end_and_final_mismatch(self):
         with tempfile.TemporaryDirectory() as d:
             s=link();recording(s,d)
             s._handle_marker(f'# ENDED,2,{RID},-1,host_stop,0')
-            self.assertTrue(s.manifest['complete'])
+            self.assertTrue(s.recording.manifest['complete'])
             s._handle_marker(f'# ENDED,2,{RID},999,host_stop,0')
-            self.assertTrue(s.manifest['complete'])
+            self.assertTrue(s.recording.manifest['complete'])
         with tempfile.TemporaryDirectory() as d:
             s=link();recording(s,d);s._handle_data_line(wire())
             s._handle_marker(f'# ENDED,2,{RID},1,host_stop,0')
-            self.assertFalse(s.manifest['complete'])
+            self.assertFalse(s.recording.manifest['complete'])
     def test_start_backlog_and_overflow(self):
         with tempfile.TemporaryDirectory() as d:
             s=link();paths=recording(s,d)
-            s.state='STARTING';s._record_started=False
-            s._handle_data_line(wire(0,10));self.assertEqual(s._rows_written,0)
-            s.state='RUNNING';s._record_started=True
+            s.state='STARTING';s.recording.started=False
+            s._handle_data_line(wire(0,10));self.assertEqual(s.recording.rows,0)
+            s.state='RUNNING';s.recording.started=True
             s.feed_bytes(b'DATA2,'+b'9'*1100+b'\n')
-            self.assertEqual(s._run_bad_lines,1)
-            s.feed_bytes((wire()+'\n').encode());self.assertEqual(s._rows_written,1)
+            self.assertEqual(s.recording.bad_lines,1)
+            s.feed_bytes((wire()+'\n').encode());self.assertEqual(s.recording.rows,1)
             s._fault('test_end')

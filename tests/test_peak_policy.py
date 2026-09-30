@@ -16,11 +16,11 @@ def sample(i, value, **changes):
     return logger.Sample(**base)
 
 def detect(values, config=None, modify=None):
-    events=[];d=PeakFlowDetector(config or PeakDetectionConfig(),events.append)
+    events=[];d=PeakFlowDetector(config or PeakDetectionConfig())
     for i,v in enumerate([0]+values+[0]):
         s=sample(i,v)
         if modify:s=modify(s)
-        d.push(s)
+        events.extend(d.push(s))
     return d,events
 
 class Policy(unittest.TestCase):

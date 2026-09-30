@@ -30,7 +30,7 @@ for changed qualification, warmup populations, timing and partial-event behavior
 Install Arduino CLI 1.5.1 and `arduino-cli core install arduino:renesas_uno@1.6.0`.
 The build script rejects another installed core version and uses the UNO R4 WiFi
 FQBN. It creates a matching sketch folder/build tree in a temporary directory,
-passes the source SHA256 as MECH_BUILD_ID and verified core as MECH_CORE_ID,
+passes a SHA256 over the sketch and acquisition/telemetry headers as MECH_BUILD_ID and verified core as MECH_CORE_ID,
 and deletes build artifacts afterward.
 The source ID is not a deployed binary signature. Builds without explicitly
 supplied identities, including ordinary IDE builds, report both as unknown.
@@ -72,3 +72,20 @@ holds centre before USB diagnostics and both I2C buses initialize.
 Completed run IDs are retained without eviction for 64 owned sessions per boot.
 At that limit, new START commands are rejected until a deliberate board reset;
 this makes delayed command replay fail closed without unbounded memory.
+
+## Implementation boundaries
+
+- `analysis.py` owns timestamps, smoothing, and continuity for live capture and replay.
+- `peak_detection.py` returns typed peak events; it performs no storage callbacks.
+- `recording.py` owns CSV streams, event persistence, and atomic manifest publication.
+- `serial_link.py` owns transport and run control; `recording_worker.py` processes a
+  bounded FIFO of recording operations (256 waiting operations, 1.5-second maximum
+  operation/queue latency). Overflow or a stalled worker faults ownership and disables
+  heartbeats. An ENDED barrier closes all accepted work before reporting completion.
+- `plot_buffer.py` owns display snapshots. `Data_Logger.txt` is the UI entry point.
+- `acquisition.h` owns the named scan stages and captured `ScanSnapshot`;
+  `telemetry.h` formats completed snapshots without mutating sensor state.
+
+Replay imports only analysis/schema modules; it requires neither Matplotlib nor
+pyserial. New manifests hash every runtime Python module. Replay also accepts
+historical schema-2 manifests containing the original two software hashes.
