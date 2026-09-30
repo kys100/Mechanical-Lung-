@@ -1,0 +1,1304 @@
+#!/usr/bin/env python3
+"""
+Data Logger — companion to MechLung.ino
+
+What it does
+------------
+  - Opens the same serial link the Arduino Serial Monitor/Plotter would use.
+  - Sends the single-byte commands the sketch accepts:
+        1-4        preset profile — automatically starts a timed run
+        s / S      demo sine
+        H / h / 0  hold / idle
+        X / x      calibration hold
+        m / M      toggle the sketch's human-readable Monitor block
+        ?          reprint the sketch's banner / help
+    Handled locally, NOT sent to the board:
+        p          abort the active run and discard its partial files
+        q          quit
+    The logger also sends an internal heartbeat so a logger-controlled run
+    returns to centre if this process or its serial connection disappears.
+    Click on any plot window to give it focus, then press a key.
+
+  - Timed runs: selecting a preset automatically starts recording and a
+    --run-seconds countdown (default 180 seconds). At timeout, recording is
+    kept and the actuator is returned to centre. Pressing 'p' aborts early,
+    deletes that run's partial files, and returns the actuator to centre.
+    Switching manually to hold, calibration, or demo sine ends a run early
+    but keeps its recording.
+
+  - Reads the sketch's per-cycle "DATA,..." line (37 fields, see the
+    "# DATA line" banner MechLung.ino prints at boot) and live-plots it as
+    three separately-scaled windows:
+        1) Flow sensor      — raw + smoothed (moving average), autoscaled
+        2) Actuator command vs. measured feedback (% of stroke)
+        3) All 7 SDP811 pressure channels, autoscaled, with an ok-count
+           and average-temperature readout
+
+  - Each timed run writes TWO CSVs sharing one base name:
+
+        <preset>_<timestamp>.csv
+            Every parsed DATA row — host and board timestamps, flow, all 7
+            pressure channels and validity flags, average temperature,
+            actuator command/feedback in DAC counts and percent-of-stroke,
+            commanded flow/phase targets, per-sensor sample ages, preset,
+            and clamp status.
+
+        <preset>_<timestamp>_peaks.csv
+            ONE ROW PER DETECTED PEAK-FLOW EVENT. The live trailing-average
+            flow (--avg) is segmented into breath excursions by a
+            hysteresis threshold, so excursion start/end times can lag by
+            roughly half that live window; within each excursion the raw
+            flow is re-smoothed (--peak-smooth) with a
+            ZERO-LAG CENTRED moving average and the peak located on that,
+            so the pressures logged are the ones measured at the true
+            flow peak rather than one half-averaging-window late. Each
+            row carries the instantaneous 7-channel pressures at the peak
+            AND their means over the plateau (samples within
+            --peak-plateau of the peak), which is the more usable number
+            when the flow signal is noisy. It also reports target-flow error,
+            target pass/fail, sensor age/skew, pressure validity, and pressure
+            variation across the plateau. Initial breath cycles are retained
+            with `is_warmup=1`, and disjoint plateau samples are exposed with
+            `plateau_contiguous=0` for downstream CFD filtering.
+
+    Demo sine still plots live but is not automatically recorded.
+
+Requires: pyserial, matplotlib
+    pip install pyserial matplotlib
+
+Usage:
+    python "Data Logger"                            # prompts you to pick a port
+    python "Data Logger" --port COM5
+    python "Data Logger" --port /dev/ttyACM0 --avg 9 --window 30
+    python "Data Logger" --list-ports
+"""
+
+import argparse
+import bisect
+import csv
+import math
+import os
+import sys
+import threading
+import time
+from collections import deque, namedtuple
+
+# PeakFlowDetector, PeakDetectionConfig and centred_moving_average are also
+# re-exported here: existing callers and test_data_logger.py access them as
+# attributes of this module (e.g. LOGGER.PeakFlowDetector).
+from peak_detection import (
+    DEFAULT_MAX_SENSOR_AGE_MS,
+    DEFAULT_PEAK_THRESHOLD_FLOOR,
+    DEFAULT_PEAK_THRESHOLD_FRAC,
+    DEFAULT_PEAK_TOLERANCE_PCT,
+    DEFAULT_WARMUP_BREATHS,
+    PeakDetectionConfig,
+    PeakFlowDetector,
+    centred_moving_average,
+)
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    sys.exit("Missing dependency 'pyserial'. Install it with:\n"
+             "    pip install pyserial")
+
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+except ImportError:
+    sys.exit("Missing dependency 'matplotlib'. Install it with:\n"
+             "    pip install matplotlib")
+
+
+NUM_PSENS = 7
+DATA_FIELDS = 37  # "DATA" + 36 values; must match MechLung.ino's log row
+DEFAULT_RUN_SECONDS = 180.0
+
+# ---------------------------------------------------------------------------
+# Serial commands the sketch understands — see handleSerial() in MechLung.ino.
+# Kept as a dict so on_key() can both validate and label whatever key was
+# pressed. 'p' and 'q' are handled locally and never written to the board.
+# ---------------------------------------------------------------------------
+COMMANDS = {
+    '1': "Preset 1", '2': "Preset 2", '3': "Preset 3", '4': "Preset 4",
+    's': "Demo sine", 'S': "Demo sine",
+    'h': "Hold / idle", 'H': "Hold / idle", '0': "Hold / idle",
+    'x': "Calibration hold", 'X': "Calibration hold",
+    'm': "Toggle Monitor block", 'M': "Toggle Monitor block",
+    '?': "Reprint sketch banner",
+}
+
+PRESET_KEYS = frozenset('1234')
+SAFETY_OVERRIDE_KEYS = frozenset('Hh0Xx')
+MOTION_OVERRIDE_KEYS = frozenset('Ss')
+
+PRESET_NAMES = {-2: "demo-sine", -1: "idle/hold",
+                0: "preset 1", 1: "preset 2", 2: "preset 3", 3: "preset 4"}
+PHASE_NAMES = {-1: "n/a", 0: "expiration", 1: "inspiration"}
+
+COMMAND_HELP = ("Click a plot window, then press: "
+                "1-4 preset (auto-records, timed) | s sine | H hold | "
+                "X calib | m monitor | p abort run | q quit")
+
+# Recordings always go here, next to the script itself — not wherever the
+# process's current working directory happens to be. That directory varies
+# by how the script gets launched (IDE, shortcut, task scheduler, etc.) and
+# can end up somewhere without write access, causing PermissionError.
+try:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    SCRIPT_DIR = os.getcwd()
+RECORDINGS_DIR = os.path.join(SCRIPT_DIR, "recordings")
+
+# One parsed DATA row. Kept as a namedtuple rather than a bare tuple so the
+# peak detector and the CSV writers index it by name — the 37-field wire
+# format is fiddly enough without positional indexing downstream too.
+Sample = namedtuple("Sample", [
+    "seq", "ms", "t_s", "host_unix",
+    "flow_raw", "flow_avg", "flow_ok", "flow_age_us",
+    "pa", "temp", "pok", "pa_age_us", "cmd_dac", "feedback_dac",
+    "cmd_pct", "fdbk_pct", "target_flow_slm", "target_peak_slm",
+    "phase", "preset", "clamped",
+])
+
+
+class MillisUnwrapper:
+    """Convert the board's uint32 millis counter into monotonic seconds.
+
+    Unsigned subtraction naturally handles the roughly 49.7-day wrap. A
+    backward jump larger than half the uint32 range is treated as a board
+    reset and starts a new segment without making plotted time go backward.
+    """
+
+    def __init__(self):
+        self.last_ms = None
+        self.elapsed_ms = 0
+        self.reset_count = 0
+
+    def update(self, ms):
+        ms &= 0xFFFFFFFF
+        reset = False
+        if self.last_ms is not None:
+            delta = (ms - self.last_ms) & 0xFFFFFFFF
+            if delta <= 0x7FFFFFFF:
+                self.elapsed_ms += delta
+            else:
+                self.reset_count += 1
+                reset = True
+        self.last_ms = ms
+        return self.elapsed_ms / 1000.0, reset
+
+
+def open_unique_csv_pair(directory, base):
+    """Create two recording files without ever truncating an old session."""
+    os.makedirs(directory, exist_ok=True)
+    for index in range(10000):
+        suffix = "" if index == 0 else f"_{index:02d}"
+        data_path = os.path.join(directory, base + suffix + ".csv")
+        peak_path = os.path.join(directory, base + suffix + "_peaks.csv")
+        data_file = None
+        try:
+            data_file = open(data_path, "x", newline="")
+            try:
+                peak_file = open(peak_path, "x", newline="")
+            except FileExistsError:
+                data_file.close()
+                os.unlink(data_path)
+                continue
+            except Exception:
+                data_file.close()
+                os.unlink(data_path)
+                raise
+            return data_path, peak_path, data_file, peak_file
+        except FileExistsError:
+            continue
+    raise OSError("could not allocate a unique recording filename")
+
+
+def list_ports():
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("No serial ports found.")
+    for p in ports:
+        print(f"  {p.device}  —  {p.description}")
+    return ports
+
+
+def pick_port():
+    ports = list_ports()
+    if not ports:
+        print("Plug in the board and try again, or pass --port explicitly.")
+        sys.exit(1)
+    if len(ports) == 1:
+        print(f"Using the only port available: {ports[0].device}")
+        return ports[0].device
+    print()
+    for i, p in enumerate(ports):
+        print(f"  [{i}] {p.device}  —  {p.description}")
+    while True:
+        choice = input(f"Select port [0-{len(ports) - 1}]: ").strip()
+        try:
+            idx = int(choice)
+            if 0 <= idx < len(ports):
+                return ports[idx].device
+        except ValueError:
+            pass
+        print("Invalid selection, try again.")
+
+
+class SerialLink:
+    """Owns the serial connection.
+
+    A background thread continuously reads lines: "DATA,..." lines are
+    parsed into shared, lock-protected buffers (with a streaming moving
+    average applied to the flow channel as samples arrive); any other line
+    (the sketch's "# ..." banner / human-readable Monitor block) is just
+    echoed to the terminal. The main thread can call send_command() at any
+    time to write a single command byte, same as the sketch's serial
+    protocol expects.
+    """
+
+    def __init__(self, port, baud, avg_window, buffer_seconds=180.0,
+                 sample_hz=100.0, peak_config=None,
+                 run_seconds=DEFAULT_RUN_SECONDS):
+        self.ser = serial.Serial(port, baud, timeout=0.2, write_timeout=1.0)
+        self._serial_write_lock = threading.Lock()
+        self._heartbeat_interval = 0.5
+        self._last_heartbeat = 0.0
+        self.connection_error = None
+        self.connected = True
+        self._ready_event = threading.Event()
+        self.avg_window = max(1, avg_window)
+        self.peak_config = peak_config or PeakDetectionConfig(
+            smooth_window=self.avg_window)
+        self._flow_hist = deque(maxlen=self.avg_window)
+        self._flow_sum = 0.0  # running sum: O(1) average instead of O(w)
+
+        maxlen = int(buffer_seconds * sample_hz)
+        self.lock = threading.Lock()
+        self.t = deque(maxlen=maxlen)
+        self.flow_raw = deque(maxlen=maxlen)
+        self.flow_avg = deque(maxlen=maxlen)
+        self.flow_ok = deque(maxlen=maxlen)
+        self.flow_age_us = deque(maxlen=maxlen)
+        self.psens_pa = [deque(maxlen=maxlen) for _ in range(NUM_PSENS)]
+        self.psens_temp_avg = deque(maxlen=maxlen)
+        self.psens_ok = [deque(maxlen=maxlen) for _ in range(NUM_PSENS)]
+        self.psens_age_us = [deque(maxlen=maxlen) for _ in range(NUM_PSENS)]
+        self.cmd_dac = deque(maxlen=maxlen)
+        self.feedback_dac = deque(maxlen=maxlen)
+        self.cmd_pct = deque(maxlen=maxlen)
+        self.fdbk_pct = deque(maxlen=maxlen)
+        self.target_flow_slm = deque(maxlen=maxlen)
+        self.target_peak_slm = deque(maxlen=maxlen)
+        self.phase = deque(maxlen=maxlen)
+        self.preset = deque(maxlen=maxlen)
+        self.clamped = deque(maxlen=maxlen)
+
+        self._clock = MillisUnwrapper()
+        self._stop = threading.Event()
+        self.bad_lines = 0
+        self.dropped_rows = 0
+        self._last_seq = None
+
+        # One snapshot is taken per animation frame and shared by all three
+        # figures. Previously each figure independently copied the complete
+        # buffer, duplicating the largest redraw cost three times per frame.
+        self._snap_cache = None
+        self._snap_stamp = 0.0
+        self._snap_ttl = 0.04
+
+        # Recording state — guarded separately from the plot-buffer lock so
+        # a slow disk write can never stall the live plots.
+        self._record_lock = threading.Lock()
+        self._record_file = None
+        self._record_writer = None
+        self._record_path = None
+        self._peak_file = None
+        self._peak_writer = None
+        self._peak_path = None
+        self._detector = None
+        self._rows_written = 0
+        self._run_bad_lines = 0
+        self._run_dropped_rows = 0
+        self._run_first_t_s = None
+        self._run_last_t_s = None
+        self._last_preset = None  # most recent preset seen in a DATA row
+        self._record_expected_preset = None
+        self._record_started = False
+
+        # Run state uses a generation token so a cancelled Timer callback can
+        # never stop or centre a newer run that starts at the same boundary.
+        self.run_seconds = run_seconds
+        self._run_lock = threading.Lock()
+        self._run_timer = None
+        self._run_start_monotonic = None
+        self._run_generation = 0
+
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+
+    # ---------------------------------------------------------------- I/O
+
+    def send_command(self, ch):
+        if ch not in COMMANDS:
+            return False
+        try:
+            with self._serial_write_lock:
+                self.ser.write(ch.encode("ascii"))
+                self.ser.flush()
+        except (serial.SerialException, OSError) as e:
+            print(f"-> serial write failed: {e}")
+            self.connection_error = str(e)
+            self.connected = False
+            return False
+        return True
+
+    def _send_heartbeat(self):
+        now = time.monotonic()
+        if now - self._last_heartbeat < self._heartbeat_interval:
+            return True
+        try:
+            with self._serial_write_lock:
+                self.ser.write(b"!")
+            self._last_heartbeat = now
+            return True
+        except (serial.SerialException, OSError) as e:
+            self.connection_error = str(e)
+            self.connected = False
+            print(f"-> serial heartbeat failed; acquisition stopped: {e}")
+            return False
+
+    def wait_until_ready(self, timeout):
+        """Ask the firmware to acknowledge that setup() has reached loop()."""
+        if not self.send_command("?"):
+            return False
+        return self._ready_event.wait(timeout)
+
+    def _reader_loop(self):
+        try:
+            while not self._stop.is_set():
+                if not self._send_heartbeat():
+                    break
+                try:
+                    raw = self.ser.readline()
+                except (serial.SerialException, OSError) as e:
+                    self.connection_error = str(e)
+                    self.connected = False
+                    print(f"-> serial connection lost; acquisition stopped: {e}")
+                    break
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith("DATA,"):
+                    self._handle_data_line(line)
+                else:
+                    # Sketch's "# ..." startup banner / human Monitor block —
+                    # not plotted, just echoed so it's visible in the terminal.
+                    if line == "# READY_QUERY":
+                        self._ready_event.set()
+                    print(line)
+        finally:
+            self.connected = False
+            if not self._stop.is_set():
+                with self._run_lock:
+                    self._cancel_run_timer_locked()
+                    if self._record_file is not None:
+                        self.stop_recording()
+
+    def _handle_data_line(self, line):
+        # MechLung.ino's DATA line — 37 comma-separated fields:
+        #   DATA,seq,millis,flow_slm,flow_ok,
+        #        flow_age_us,Psens1_pa..Psens7_pa,psens_temp_c_avg,
+        #        Psens1_ok..Psens7_ok,Psens1_age_us..Psens7_age_us,
+        #        cmd_dac,feedback_dac,cmd_pct,fdbk_pct,
+        #        target_flow_slm,target_peak_slm,phase,preset,clamped
+        parts = line.split(",")
+        if len(parts) != DATA_FIELDS:
+            self._count_bad_line()
+            return
+        try:
+            seq = int(parts[1])
+            ms = int(parts[2])
+            flow_slm = float(parts[3])
+            flow_ok = bool(int(parts[4]))
+            flow_age_us = int(parts[5])
+            pa = [float(parts[6 + i]) for i in range(NUM_PSENS)]
+            temp = float(parts[13])
+            pok = [bool(int(parts[14 + i])) for i in range(NUM_PSENS)]
+            pa_age_us = [int(parts[21 + i]) for i in range(NUM_PSENS)]
+            cmd_dac = int(parts[28])
+            feedback_dac = float(parts[29])
+            cmd_pct = float(parts[30])
+            fdbk_pct = float(parts[31])
+            target_flow_slm = float(parts[32])
+            target_peak_slm = float(parts[33])
+            phase = int(parts[34])
+            preset = int(parts[35])
+            clamped = bool(int(parts[36]))
+        except (ValueError, IndexError):
+            self._count_bad_line()
+            return
+
+        t_s, board_reset = self._clock.update(ms)
+        if board_reset:
+            self._flow_hist.clear()
+            self._flow_sum = 0.0
+            print("-> board millis counter moved backward; starting a new time segment")
+
+        seq_gap = 0
+        if self._last_seq is not None and seq > self._last_seq + 1:
+            seq_gap = seq - self._last_seq - 1
+            self.dropped_rows += seq_gap
+        self._last_seq = seq
+
+        # Streaming moving average, maintained with a running sum so the
+        # cost per sample is constant rather than proportional to --avg.
+        if flow_ok:
+            if len(self._flow_hist) == self._flow_hist.maxlen:
+                self._flow_sum -= self._flow_hist[0]
+            self._flow_hist.append(flow_slm)
+            self._flow_sum += flow_slm
+        else:
+            # Never blend measurements from opposite sides of a data gap.
+            self._flow_hist.clear()
+            self._flow_sum = 0.0
+        flow_avg = (self._flow_sum / len(self._flow_hist)
+                    if self._flow_hist else 0.0)
+
+        sample = Sample(seq, ms, t_s, time.time(), flow_slm, flow_avg,
+                        flow_ok, flow_age_us, pa, temp, pok, pa_age_us,
+                        cmd_dac, feedback_dac, cmd_pct, fdbk_pct,
+                        target_flow_slm, target_peak_slm, phase,
+                        preset, clamped)
+
+        with self.lock:
+            self.t.append(t_s)
+            self.flow_raw.append(flow_slm)
+            self.flow_avg.append(flow_avg)
+            self.flow_ok.append(flow_ok)
+            self.flow_age_us.append(flow_age_us)
+            for i in range(NUM_PSENS):
+                self.psens_pa[i].append(pa[i])
+                self.psens_ok[i].append(pok[i])
+                self.psens_age_us[i].append(pa_age_us[i])
+            self.psens_temp_avg.append(temp)
+            self.cmd_dac.append(cmd_dac)
+            self.feedback_dac.append(feedback_dac)
+            self.cmd_pct.append(cmd_pct)
+            self.fdbk_pct.append(fdbk_pct)
+            self.target_flow_slm.append(target_flow_slm)
+            self.target_peak_slm.append(target_peak_slm)
+            self.phase.append(phase)
+            self.preset.append(preset)
+            self.clamped.append(clamped)
+
+        self._last_preset = preset
+
+        with self._record_lock:
+            if self._record_writer is None:
+                return
+            if not self._record_sample_allowed_locked(preset):
+                return
+            self._run_dropped_rows += seq_gap
+            if self._run_first_t_s is None:
+                self._run_first_t_s = t_s
+            self._run_last_t_s = t_s
+            try:
+                self._record_writer.writerow(
+                    [f"{sample.host_unix:.3f}", seq, ms, f"{t_s:.4f}",
+                     f"{flow_slm:.4f}", int(flow_ok), flow_age_us]
+                    + [f"{v:.4f}" for v in pa]
+                    + [f"{temp:.2f}"]
+                    + [int(v) for v in pok]
+                    + pa_age_us
+                    + [cmd_dac, f"{feedback_dac:.2f}",
+                       f"{cmd_pct:.2f}", f"{fdbk_pct:.2f}",
+                       f"{target_flow_slm:.3f}", f"{target_peak_slm:.3f}",
+                       phase, preset,
+                       int(clamped)]
+                )
+                self._rows_written += 1
+                # Flush periodically so an unplanned exit (unplugged board,
+                # closed window, power cut mid-run) costs at most one second
+                # of data rather than the whole OS buffer.
+                if self._rows_written % 100 == 0:
+                    self._record_file.flush()
+                if self._detector is not None:
+                    self._detector.push(sample)
+            except (OSError, ValueError) as e:
+                self._abort_recording_locked(e)
+
+    # ----------------------------------------------------------- plotting
+
+    def snapshot(self):
+        """Consistent copy of every series, cached for one frame period."""
+        now = time.monotonic()
+        if self._snap_cache is not None and now - self._snap_stamp < self._snap_ttl:
+            return self._snap_cache
+        with self.lock:
+            snap = (list(self.t), list(self.flow_raw), list(self.flow_avg),
+                    list(self.flow_ok),
+                    list(self.flow_age_us),
+                    [list(d) for d in self.psens_pa], list(self.psens_temp_avg),
+                    [list(d) for d in self.psens_ok],
+                    [list(d) for d in self.psens_age_us],
+                    list(self.cmd_dac), list(self.feedback_dac),
+                    list(self.cmd_pct), list(self.fdbk_pct),
+                    list(self.target_flow_slm), list(self.target_peak_slm),
+                    list(self.phase),
+                    list(self.preset), list(self.clamped))
+        self._snap_cache, self._snap_stamp = snap, now
+        return snap
+
+    # ---------------------------------------------------------- recording
+
+    def _record_sample_allowed_locked(self, preset):
+        """Reject queued pre-command rows until the requested preset appears.
+
+        Caller holds _record_lock. Files are opened before motion is commanded
+        so the first preset sample cannot be lost; this gate makes that safe
+        when a prior demo/preset row was already queued in the serial reader.
+        A queued row from a previous run of the same preset is indistinguishable
+        here, but the firmware's ordered command stream and idle log gate make
+        that edge case safe in normal operation.
+        """
+        if self._record_started:
+            return True
+        if preset != self._record_expected_preset:
+            return False
+        self._record_started = True
+        return True
+
+    def _write_peak_row(self, ev):
+        s = ev["sample"]
+        row = ([ev["peak_idx"], f"{s.host_unix:.3f}", s.seq, s.ms,
+                f"{s.t_s:.4f}", f"{ev['peak_time_s']:.5f}",
+                f"{ev['peak_offset_samples']:.3f}",
+                PRESET_NAMES.get(s.preset, s.preset),
+                PHASE_NAMES.get(s.phase, s.phase),
+                "positive" if ev["direction"] > 0 else "negative",
+                f"{ev['flow_peak_slm']:.4f}", f"{s.flow_raw:.4f}",
+                int(s.flow_ok), s.flow_age_us,
+                f"{s.target_flow_slm:.4f}", f"{ev['target_peak_slm']:.4f}",
+                f"{ev['target_error_slm']:.4f}",
+                f"{ev['target_error_pct']:.3f}",
+                "" if ev["target_met"] is None else int(ev["target_met"]),
+                int(ev["is_warmup"])]
+               + [f"{v:.4f}" for v in s.pa]
+               + [f"{v:.4f}" for v in ev["pa_mean"]]
+               + [f"{v:.4f}" for v in ev["pa_std"]]
+               + [int(v) for v in s.pok]
+               + list(s.pa_age_us)
+               + [f"{v:.3f}" for v in ev["pa_ok_frac"]]
+               + [int(ev["pressure_all_ok"]), ev["max_pressure_age_us"],
+                  ev["pressure_age_span_us"], ev["flow_pressure_skew_us"],
+                  int(ev["timing_ok"]),
+                  "" if ev["qualified_peak"] is None else
+                  int(ev["qualified_peak"]),
+                  int(ev["excursion_complete"]),
+                  f"{s.temp:.2f}", ev["plateau_n"],
+                  int(ev["plateau_contiguous"]),
+                  f"{ev['plateau_span_s']:.4f}", ev["excursion_n"],
+                  f"{ev['excursion_s']:.3f}",
+                  s.cmd_dac, f"{s.feedback_dac:.2f}",
+                  f"{s.cmd_dac - s.feedback_dac:.2f}",
+                  f"{s.cmd_pct:.2f}", f"{s.fdbk_pct:.2f}", int(s.clamped)])
+        self._peak_writer.writerow(row)
+        self._peak_file.flush()  # one row per breath — always worth flushing
+        target_result = ("PARTIAL" if not ev["excursion_complete"] else
+                         ("N/A" if ev["target_met"] is None else
+                         ("PASS" if ev["target_met"] else "MISS")))
+        capture_result = ("PARTIAL" if ev["qualified_peak"] is None else
+                          ("VALID" if ev["qualified_peak"] else "INVALID"))
+        print(f"-> peak #{ev['peak_idx']:3d} "
+              f"{PHASE_NAMES.get(s.phase, s.phase):>11}  "
+              f"{ev['flow_peak_slm']:7.2f} slm   "
+              f"target {ev['target_peak_slm']:6.2f} ({target_result}; "
+              f"capture {capture_result})   "
+              f"{'[WARMUP] ' if ev['is_warmup'] else ''}"
+              f"P1..P7 (plateau mean, Pa): "
+              + " ".join(f"{v:7.2f}" for v in ev["pa_mean"]))
+
+    def _clear_recording_state_locked(self, keep_paths=False):
+        self._record_file = self._record_writer = None
+        self._peak_file = self._peak_writer = None
+        if not keep_paths:
+            self._record_path = self._peak_path = None
+        self._detector = None
+        self._record_expected_preset = None
+        self._record_started = False
+
+    def _abort_recording_locked(self, error):
+        paths = (self._record_path, self._peak_path)
+        for file_obj in (self._record_file, self._peak_file):
+            if file_obj is not None:
+                try:
+                    file_obj.close()
+                except OSError:
+                    pass
+        # Keep paths until the timed run completes or is aborted. An abort
+        # must still be able to remove partial files after an I/O failure.
+        self._clear_recording_state_locked(keep_paths=True)
+        print(f"-> recording stopped after file I/O error: {error}\n"
+              f"     partial files: {paths[0]}\n     {paths[1]}")
+
+    def start_recording(self, preset_index=None):
+        """Begin logging to a per-sample CSV and a per-peak CSV, both named
+        after the current preset, under RECORDINGS_DIR. Returns the pair of
+        paths, or None if a recording is already in progress or a file
+        couldn't be opened (in which case a message explaining why is
+        printed here)."""
+        with self._record_lock:
+            if self._record_file is not None:
+                print("-> already recording — press 'p' to stop first")
+                return None
+            if self._record_path is not None:
+                print("-> the active run's recording already stopped after "
+                      "an I/O error")
+                return None
+
+            preset = self._last_preset if preset_index is None else preset_index
+            # Arm while the writer is still disabled. _handle_data_line()
+            # takes the same lock, so queued rows cannot race this setup.
+            self._record_expected_preset = preset
+            self._record_started = False
+            preset_name = PRESET_NAMES.get(preset, "unknown")
+            safe_name = preset_name.replace("/", "-").replace(" ", "_")
+            base = f"{safe_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+            try:
+                (data_path, peak_path,
+                 self._record_file, self._peak_file) = open_unique_csv_pair(
+                    RECORDINGS_DIR, base)
+            except OSError as e:
+                print(f"-> couldn't start recording ({e.strerror or e}); "
+                      f"directory: {RECORDINGS_DIR}")
+                for f in (self._record_file, self._peak_file):
+                    if f is not None:
+                        f.close()
+                self._record_file = self._peak_file = None
+                self._record_expected_preset = None
+                return None
+
+            self._record_path, self._peak_path = data_path, peak_path
+            self._record_writer = csv.writer(self._record_file)
+            self._peak_writer = csv.writer(self._peak_file)
+            try:
+                self._record_writer.writerow(
+                    ["host_unix_s", "seq", "millis", "t_s", "flow_slm",
+                     "flow_ok", "flow_age_us"]
+                    + [f"Psens{i + 1}_pa" for i in range(NUM_PSENS)]
+                    + ["psens_temp_c_avg"]
+                    + [f"Psens{i + 1}_ok" for i in range(NUM_PSENS)]
+                    + [f"Psens{i + 1}_age_us" for i in range(NUM_PSENS)]
+                    + ["cmd_dac", "feedback_dac", "cmd_pct", "fdbk_pct",
+                       "target_flow_slm", "target_peak_slm", "phase",
+                       "preset", "clamped"]
+                )
+                self._peak_writer.writerow(
+                    ["peak_idx", "host_unix_s", "seq", "millis",
+                     "nearest_sample_t_s", "interpolated_peak_t_s",
+                     "peak_offset_samples", "preset", "phase", "flow_sign",
+                     "flow_peak_slm", "flow_raw_at_peak_slm", "flow_ok",
+                     "flow_age_us", "target_flow_at_sample_slm",
+                     "target_peak_slm", "target_error_slm",
+                     "target_error_pct", "target_met", "is_warmup"]
+                    + [f"Psens{i + 1}_pa_at_peak" for i in range(NUM_PSENS)]
+                    + [f"Psens{i + 1}_pa_plateau_mean" for i in range(NUM_PSENS)]
+                    + [f"Psens{i + 1}_pa_plateau_std" for i in range(NUM_PSENS)]
+                    + [f"Psens{i + 1}_ok_at_peak" for i in range(NUM_PSENS)]
+                    + [f"Psens{i + 1}_age_us_at_peak" for i in range(NUM_PSENS)]
+                    + [f"Psens{i + 1}_ok_frac_plateau" for i in range(NUM_PSENS)]
+                    + ["all_pressures_ok_at_peak", "max_pressure_age_us",
+                       "pressure_age_span_us", "max_flow_pressure_skew_us",
+                       "sensor_timing_ok", "qualified_peak",
+                       "excursion_complete",
+                       "psens_temp_c_avg", "plateau_n", "plateau_contiguous",
+                       "plateau_span_s", "excursion_n", "excursion_s",
+                       "cmd_dac", "feedback_dac", "tracking_error_dac",
+                       "cmd_pct", "fdbk_pct", "clamped"]
+                )
+            except OSError as e:
+                self._abort_recording_locked(e)
+                return None
+
+            self._detector = PeakFlowDetector(
+                self.peak_config, self._write_peak_row)
+
+            self._rows_written = 0
+            self._run_bad_lines = 0
+            self._run_dropped_rows = 0
+            self._run_first_t_s = None
+            self._run_last_t_s = None
+            print(f"-> recording started:\n     samples: {data_path}\n"
+                  f"     peaks  : {peak_path}")
+            return data_path, peak_path
+
+    def stop_recording(self):
+        """Close the current recording, if any. Returns the pair of paths,
+        or None if nothing was being recorded."""
+        with self._record_lock:
+            if self._record_file is None:
+                if self._record_path is not None:
+                    paths = (self._record_path, self._peak_path)
+                    self._clear_recording_state_locked()
+                    print("-> timed run ended; partial files from the earlier "
+                          f"I/O failure were kept:\n     {paths[0]}\n"
+                          f"     {paths[1]}")
+                    return paths
+                print("-> not currently recording")
+                return None
+            paths = (self._record_path, self._peak_path)
+            try:
+                if self._detector is not None:
+                    self._detector.flush()  # emit a breath still in progress
+                    n_peaks = self._detector.count
+                    n_short = self._detector.discarded
+                    n_target_pass = self._detector.target_passes
+                    n_target_miss = self._detector.target_misses
+                    n_partial = self._detector.partial_excursions
+                    n_pressure_incomplete = self._detector.pressure_incomplete
+                    n_timing_fail = self._detector.timing_failures
+                    n_qualified = self._detector.qualified_peaks
+                    n_unqualified = self._detector.unqualified_peaks
+                else:
+                    n_peaks = n_short = n_target_pass = n_target_miss = 0
+                    n_partial = 0
+                    n_pressure_incomplete = n_timing_fail = 0
+                    n_qualified = n_unqualified = 0
+            except (OSError, ValueError) as e:
+                self._abort_recording_locked(e)
+                # stop_recording() is itself a run-ending path, so there is
+                # no later abort that needs the remembered filenames.
+                self._clear_recording_state_locked()
+                return paths
+            for f in (self._record_file, self._peak_file):
+                try:
+                    f.close()
+                except OSError as e:
+                    print(f"-> warning: error closing recording file: {e}")
+            self._clear_recording_state_locked()
+            elapsed_s = ((self._run_last_t_s - self._run_first_t_s)
+                         if self._run_first_t_s is not None and
+                         self._run_last_t_s is not None else 0.0)
+            effective_hz = ((self._rows_written - 1) / elapsed_s
+                            if self._rows_written > 1 and elapsed_s > 0.0
+                            else 0.0)
+            print(f"-> recording stopped: {self._rows_written} samples, "
+                  f"{n_peaks} peaks"
+                  + (f" ({n_short} excursions too short, discarded)" if n_short else "")
+                  + (f", {self._run_bad_lines} malformed rows skipped"
+                     if self._run_bad_lines else "")
+                  + f", target {n_target_pass} pass/{n_target_miss} miss"
+                  + f", combined flow+pressure {n_qualified} valid/"
+                    f"{n_unqualified} invalid"
+                  + f", {n_partial} partial excursions excluded from target scoring"
+                  + f", pressure incomplete at {n_pressure_incomplete} peaks"
+                  + f", sensor timing failed at {n_timing_fail} peaks"
+                  + f", effective {effective_hz:.2f} Hz"
+                  + f", {self._run_dropped_rows} sequence rows missing"
+                  + f"\n     {paths[0]}\n     {paths[1]}")
+            return paths
+
+    def _count_bad_line(self):
+        self.bad_lines += 1
+        with self._record_lock:
+            if self._record_file is not None:
+                self._run_bad_lines += 1
+
+    def _cancel_run_timer_locked(self):
+        """Cancel the current timer and invalidate any callback already queued.
+
+        Caller must hold _run_lock. Timer.cancel() cannot prevent a callback
+        that has already begun, so the generation increment is authoritative.
+        """
+        self._run_generation += 1
+        if self._run_timer is not None:
+            self._run_timer.cancel()
+        self._run_timer = None
+        self._run_start_monotonic = None
+
+    def begin_timed_run(self, preset_index, command):
+        """Open recording, command the preset, then arm its safety timer."""
+        with self._run_lock:
+            if self._run_timer is not None:
+                return False
+            self._last_seq = None
+            paths = self.start_recording(preset_index)
+            if not self.send_command(command):
+                if paths is not None:
+                    self._discard_recording()
+                return False
+            self._run_generation += 1
+            generation = self._run_generation
+            self._run_start_monotonic = time.monotonic()
+            timer = threading.Timer(self.run_seconds, self._on_run_timeout,
+                                    args=(generation,))
+            timer.daemon = True
+            self._run_timer = timer
+            timer.start()
+            if paths is None:
+                print("-> timed motion armed, but CSV recording could not start")
+            else:
+                print(f"-> timed run armed for {self.run_seconds:g} seconds")
+            return True
+
+    def _on_run_timeout(self, generation):
+        with self._run_lock:
+            if (generation != self._run_generation or
+                    self._run_timer is None):
+                return
+            self._run_timer = None
+            self._run_start_monotonic = None
+            self._run_generation += 1
+            if self.connected:
+                self.send_command("H")
+            self.stop_recording()
+            print("-> timed run complete; actuator returned to hold")
+
+    def run_in_progress(self):
+        with self._run_lock:
+            return self._run_timer is not None
+
+    def run_remaining(self):
+        with self._run_lock:
+            if self._run_start_monotonic is None:
+                return None
+            return max(0.0, self.run_seconds -
+                       (time.monotonic() - self._run_start_monotonic))
+
+    def end_run_override(self):
+        """Keep partial CSVs when a manual mode switch ends a run early."""
+        with self._run_lock:
+            if self._run_timer is None:
+                return False
+            self._cancel_run_timer_locked()
+            self.stop_recording()
+            print("-> timed run ended early; partial recording kept")
+            return True
+
+    def abort_run(self):
+        """Discard partial files and return the actuator to hold."""
+        with self._run_lock:
+            if self._run_timer is None:
+                print("-> no timed run is active")
+                return False
+            self._cancel_run_timer_locked()
+            if self.connected:
+                self.send_command("H")
+            self._discard_recording()
+            print("-> timed run aborted; partial recording discarded")
+            return True
+
+    def _discard_recording(self):
+        with self._record_lock:
+            paths = (self._record_path, self._peak_path)
+            for file_obj in (self._record_file, self._peak_file):
+                if file_obj is not None:
+                    try:
+                        file_obj.close()
+                    except OSError:
+                        pass
+            self._clear_recording_state_locked()
+            for path in paths:
+                if path is not None:
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as e:
+                        print(f"-> warning: could not remove partial file "
+                              f"{path}: {e}")
+
+    def close(self):
+        # A normal logger shutdown should hold immediately; the firmware
+        # heartbeat watchdog covers crashes and cable loss.
+        self._stop.set()
+        with self._run_lock:
+            self._cancel_run_timer_locked()
+            if self.connected:
+                self.send_command("H")
+            if self._record_file is not None:
+                self.stop_recording()
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+        self._thread.join(timeout=2.0)
+        if self.bad_lines:
+            print(f"-> note: {self.bad_lines} malformed/partial DATA lines "
+                  f"were skipped (normal for the first line or two after "
+                  f"connecting)")
+        if self.dropped_rows:
+            print(f"-> note: {self.dropped_rows} DATA sequence rows were "
+                  f"missing from the serial stream")
+
+
+def visible_start(t, window_s):
+    """Index of the first sample within `window_s` seconds of the latest one.
+
+    Binary search rather than the previous linear scan: this runs three
+    times per frame over a buffer that can hold tens of thousands of
+    samples, and it was the second-largest cost in the redraw path.
+    """
+    if not t:
+        return 0
+    return bisect.bisect_left(t, max(0.0, t[-1] - window_s))
+
+
+def autoscale(ax, values, min_span=1.0, pad_frac=0.15):
+    """Pad around the visible min/max, never collapsing to a zero-height
+    window when the signal is flat."""
+    if not values:
+        return
+    lo, hi = min(values), max(values)
+    pad = max((hi - lo) * pad_frac, min_span)
+    ax.set_ylim(lo - pad, hi + pad)
+
+
+def set_title(fig, text):
+    try:
+        fig.canvas.manager.set_window_title(text)
+    except Exception:
+        pass  # backend-dependent; purely cosmetic
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def nonnegative_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+def positive_float(value):
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or not (parsed > 0.0):
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def unit_fraction(value):
+    parsed = positive_float(value)
+    if parsed > 1.0:
+        raise argparse.ArgumentTypeError("must be no greater than one")
+    return parsed
+
+
+def percentage(value):
+    parsed = positive_float(value)
+    if parsed > 100.0:
+        raise argparse.ArgumentTypeError("must be no greater than 100")
+    return parsed
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", help="Serial port (e.g. COM5, /dev/ttyACM0). Prompts if omitted.")
+    ap.add_argument("--baud", type=positive_int, default=115200, help="Must match Serial.begin() in the sketch.")
+    ap.add_argument("--window", type=positive_float, default=20.0, help="Seconds of history shown on screen.")
+    ap.add_argument("--avg", type=positive_int, default=9,
+                    help="Trailing moving-average window for the live flow "
+                         "display (samples; default: 9).")
+    ap.add_argument("--peak-smooth", type=positive_int, default=None,
+                    help="Centred moving-average window used for offline peak "
+                         "location. Defaults to --avg when omitted.")
+    ap.add_argument("--buffer", type=positive_float, default=180.0,
+                    help="Seconds of history retained in memory.")
+    ap.add_argument("--peak-threshold-frac", type=unit_fraction,
+                    default=DEFAULT_PEAK_THRESHOLD_FRAC,
+                    help="Fraction of the current phase target used to open an "
+                         "excursion (default: 0.35).")
+    ap.add_argument("--peak-threshold-floor", type=positive_float,
+                    default=DEFAULT_PEAK_THRESHOLD_FLOOR,
+                    help="Minimum excursion-opening threshold in slm, also used "
+                         "when no phase target is available (default: 1.5).")
+    ap.add_argument("--peak-exit", type=unit_fraction, default=0.5,
+                    help="Excursion closes when |flow| drops below this fraction "
+                         "of its latched adaptive threshold.")
+    ap.add_argument("--peak-min-samples", type=positive_int, default=5,
+                    help="Excursions shorter than this are discarded as noise.")
+    ap.add_argument("--peak-plateau", type=unit_fraction, default=0.99,
+                    help="Plateau = samples within this fraction of the peak; the "
+                         "peaks CSV reports the mean pressure across it. The 0.99 "
+                         "default limits Q-squared pressure variation to about 2%%.")
+    ap.add_argument("--warmup-breaths", type=nonnegative_int,
+                    default=DEFAULT_WARMUP_BREATHS,
+                    help="Initial complete breath cycles marked is_warmup in the "
+                         "peaks CSV (default: 3; rows are retained).")
+    ap.add_argument("--peak-tolerance-pct", type=percentage,
+                    default=DEFAULT_PEAK_TOLERANCE_PCT,
+                    help="Allowed absolute error from the phase's commanded "
+                         "peak flow before the peaks CSV marks a miss "
+                         "(default: 10%%).")
+    ap.add_argument("--max-sensor-age-ms", type=positive_float,
+                    default=DEFAULT_MAX_SENSOR_AGE_MS,
+                    help="Maximum flow/pressure sample age at a detected peak "
+                         "before sensor_timing_ok is false (default: 20 ms).")
+    ap.add_argument("--run-seconds", type=positive_float,
+                    default=DEFAULT_RUN_SECONDS,
+                    help="Duration of each preset's automatic recording before "
+                         "the actuator returns to hold (default: 180).")
+    ap.add_argument("--list-ports", action="store_true", help="List serial ports and exit.")
+    args = ap.parse_args()
+
+    if args.list_ports:
+        list_ports()
+        return
+
+    peak_config = PeakDetectionConfig(
+        threshold_frac=args.peak_threshold_frac,
+        min_threshold=args.peak_threshold_floor,
+        exit_frac=args.peak_exit,
+        min_samples=args.peak_min_samples,
+        plateau_frac=args.peak_plateau,
+        smooth_window=args.peak_smooth or args.avg,
+        target_tolerance_frac=args.peak_tolerance_pct / 100.0,
+        max_sensor_age_us=args.max_sensor_age_ms * 1000.0,
+        warmup_breaths=args.warmup_breaths,
+    )
+    port = args.port or pick_port()
+    print(f"Connecting to {port} @ {args.baud}...")
+    try:
+        link = SerialLink(port, args.baud, args.avg,
+                          buffer_seconds=args.buffer,
+                          peak_config=peak_config,
+                          run_seconds=args.run_seconds)
+    except (serial.SerialException, OSError) as e:
+        sys.exit(f"Couldn't open {port}: {e}\n"
+                 f"Close the Arduino Serial Monitor (only one program can hold "
+                 f"the port) and check the board is plugged in.")
+
+    # Opening the port resets most Arduino boards. Wait through the normal
+    # centre-hold, then require an acknowledgement emitted only from loop().
+    time.sleep(2.5)
+    if not link.wait_until_ready(5.0):
+        link.close()
+        sys.exit("Firmware did not acknowledge readiness within 5 seconds; "
+                 "the board may still be booting or running an incompatible "
+                 "sketch.")
+    print(f"Connected. {COMMAND_HELP}\n")
+
+    # Free up the keys we use from matplotlib's default keymaps (h/s/q/etc.
+    # are normally bound to home/save/back/quit) so on_key() is the only
+    # thing that responds to them.
+    for action in ("keymap.home", "keymap.back", "keymap.forward", "keymap.save",
+                   "keymap.quit", "keymap.grid", "keymap.yscale", "keymap.xscale",
+                   "keymap.pan", "keymap.zoom", "keymap.fullscreen", "keymap.all_axes",
+                   "keymap.help", "keymap.copy"):
+        if action in plt.rcParams:  # keymap entries vary across matplotlib versions
+            plt.rcParams[action] = []
+
+    def on_key(event):
+        key = event.key
+        if key in PRESET_KEYS:
+            if link.run_in_progress():
+                print("-> a timed run is already active; press 'p' to abort "
+                      "or H to keep and end it")
+                return
+            if link.begin_timed_run(int(key) - 1, key):
+                print(f"-> sent '{key}'  ({COMMANDS[key]})")
+        elif key in SAFETY_OVERRIDE_KEYS:
+            if link.run_in_progress():
+                sent = link.connected and link.send_command(key)
+                link.end_run_override()
+                if sent:
+                    print(f"-> sent '{key}'  ({COMMANDS[key]})")
+            elif link.send_command(key):
+                print(f"-> sent '{key}'  ({COMMANDS[key]})")
+        elif key in MOTION_OVERRIDE_KEYS:
+            if link.run_in_progress():
+                link.end_run_override()
+            if link.send_command(key):
+                print(f"-> sent '{key}'  ({COMMANDS[key]})")
+        elif key in COMMANDS:
+            if link.send_command(key):
+                print(f"-> sent '{key}'  ({COMMANDS[key]})")
+        elif event.key == "p":
+            link.abort_run()
+        elif event.key == "q":
+            plt.close("all")
+
+    # ---------------- Figure 1: flow sensor ----------------
+    fig_flow, ax_flow = plt.subplots(figsize=(8, 4.5))
+    set_title(fig_flow, "Flow sensor — live")
+    fig_flow.suptitle(COMMAND_HELP, fontsize=8)
+    raw_line, = ax_flow.plot([], [], lw=1, color="#a9c6e8", alpha=0.6, label="raw")
+    avg_line, = ax_flow.plot([], [], lw=2, color="#1f6feb", label=f"smoothed (avg {args.avg})")
+    target_line, = ax_flow.plot([], [], lw=1.2, ls="--", color="#7b1fa2",
+                                label="commanded target")
+    # Adaptive opening/exit levels follow the current phase target. The peak
+    # detector latches them per excursion; these lines are a live preview.
+    threshold_guides = []
+    for multiplier, style in ((1.0, "--"), (peak_config.exit_frac, ":")):
+        for sign in (1, -1):
+            guide = ax_flow.axhline(0, color="#c62828", lw=0.7,
+                                    ls=style, alpha=0.6)
+            threshold_guides.append((guide, multiplier, sign))
+    ax_flow.axhline(0, color="#999", lw=0.8)
+    ax_flow.set_xlabel("Time (s)")
+    ax_flow.set_ylabel("Flow (slm)")
+    ax_flow.grid(alpha=0.25)
+    ax_flow.legend(loc="upper right", fontsize=8)
+    flow_status = ax_flow.text(0.01, 0.97, "", transform=ax_flow.transAxes,
+                               va="top", fontsize=9, family="monospace")
+    fig_flow.canvas.mpl_connect("key_press_event", on_key)
+
+    # ---------------- Figure 2: actuator command/feedback ----------------
+    fig_act, ax_act = plt.subplots(figsize=(8, 4.5))
+    set_title(fig_act, "Actuator command / feedback — live")
+    fig_act.suptitle(COMMAND_HELP, fontsize=8)
+    cmd_line, = ax_act.plot([], [], lw=1.5, color="#e07b39", label="commanded")
+    fdbk_line, = ax_act.plot([], [], lw=1.5, color="#2ca02c", label="feedback")
+    ax_act.axhline(0, color="#999", lw=0.8)
+    ax_act.set_ylim(-115, 115)
+    ax_act.set_xlabel("Time (s)")
+    ax_act.set_ylabel("Position (% of stroke)")
+    ax_act.grid(alpha=0.25)
+    ax_act.legend(loc="upper right", fontsize=8)
+    act_status = ax_act.text(0.01, 0.97, "", transform=ax_act.transAxes,
+                             va="top", fontsize=9, family="monospace")
+    fig_act.canvas.mpl_connect("key_press_event", on_key)
+
+    # ---------------- Figure 3: pressure sensors (7x SDP811) ----------------
+    fig_press, ax_press = plt.subplots(figsize=(8, 4.5))
+    set_title(fig_press, "Pressure sensors — live")
+    fig_press.suptitle(COMMAND_HELP, fontsize=8)
+    press_colors = plt.cm.tab10.colors  # 10 distinct colors, first 7 used
+    press_lines = []
+    for i in range(NUM_PSENS):
+        (line,) = ax_press.plot([], [], lw=1.3, color=press_colors[i], label=f"Psens{i + 1}")
+        press_lines.append(line)
+    ax_press.axhline(0, color="#999", lw=0.8)
+    ax_press.set_xlabel("Time (s)")
+    ax_press.set_ylabel("Differential pressure (Pa)")
+    ax_press.grid(alpha=0.25)
+    ax_press.legend(loc="upper right", fontsize=7, ncol=4)
+    press_status = ax_press.text(0.01, 0.97, "", transform=ax_press.transAxes,
+                                 va="top", fontsize=9, family="monospace")
+    fig_press.canvas.mpl_connect("key_press_event", on_key)
+
+    def set_xwindow(ax, t):
+        t_now = t[-1]
+        t_lo = max(0.0, t_now - args.window)
+        ax.set_xlim(t_lo, max(t_now, t_lo + 1.0))
+
+    def update_flow(_frame):
+        (t, flow_raw, flow_avg, flow_ok, flow_age_us, *_middle,
+         target_flow, target_peak, phase, _preset, _clamped) = link.snapshot()
+        if not t:
+            return raw_line, avg_line, target_line
+        i0 = visible_start(t, args.window)
+        tw, raw_w, avg_w = t[i0:], flow_raw[i0:], flow_avg[i0:]
+        target_w = target_flow[i0:]
+        raw_line.set_data(tw, raw_w)
+        avg_line.set_data(tw, avg_w)
+        target_line.set_data(tw, target_w)
+        current_threshold = peak_config.opening_threshold(target_peak[-1])
+        for guide, multiplier, sign in threshold_guides:
+            guide.set_ydata([sign * current_threshold * multiplier] * 2)
+        set_xwindow(ax_flow, t)
+        autoscale(ax_flow, raw_w + avg_w + target_w)
+        remaining = link.run_remaining()
+        with link._record_lock:
+            recording = link._record_file is not None
+        rec = (f" [RUN {remaining:5.1f}s]" if remaining is not None else
+               (" [REC]" if recording else ""))
+        link_state = ("CONNECTED" if link.connected else
+                      f"DISCONNECTED: {link.connection_error or 'reader stopped'}")
+        flow_status.set_text(
+            f"flow: {flow_avg[-1]:7.2f} slm   "
+            f"target: {target_flow[-1]:7.2f} slm   "
+            f"threshold: {current_threshold:5.2f} slm   "
+            f"phase: {PHASE_NAMES.get(phase[-1], phase[-1])}\n"
+            f"[{'OK' if flow_ok[-1] else 'SENSOR FAULT'}; "
+            f"age {flow_age_us[-1] / 1000.0:.2f} ms]{rec}\n{link_state}"
+        )
+        return raw_line, avg_line, target_line
+
+    def update_act(_frame):
+        (t, *_rest, cmd_dac, feedback_dac, cmd_pct, fdbk_pct,
+         _target_flow, _target_peak, _phase, preset, clamped) = link.snapshot()
+        if not t:
+            return cmd_line, fdbk_line
+        i0 = visible_start(t, args.window)
+        cmd_line.set_data(t[i0:], cmd_pct[i0:])
+        fdbk_line.set_data(t[i0:], fdbk_pct[i0:])
+        set_xwindow(ax_act, t)
+        act_status.set_text(
+            f"cmd: {cmd_pct[-1]:6.1f}%   fdbk: {fdbk_pct[-1]:6.1f}%   "
+            f"({cmd_dac[-1]:4d}/{feedback_dac[-1]:7.2f} DAC)   "
+            f"mode: {PRESET_NAMES.get(preset[-1], preset[-1])}"
+            f"{'   [CLAMPED]' if clamped[-1] else ''}"
+        )
+        return cmd_line, fdbk_line
+
+    def update_press(_frame):
+        (t, _fr, _fa, _fo, _flow_age, psens_pa, psens_temp_avg,
+         psens_ok, psens_age_us, *_) = link.snapshot()
+        if not t:
+            return tuple(press_lines)
+        i0 = visible_start(t, args.window)
+        tw = t[i0:]
+        all_vals = []
+        for i, pline in enumerate(press_lines):
+            yw = psens_pa[i][i0:]
+            pline.set_data(tw, yw)
+            all_vals.extend(yw)
+        set_xwindow(ax_press, t)
+        autoscale(ax_press, all_vals)
+        ok_count = sum(1 for i in range(NUM_PSENS) if psens_ok[i][-1])
+        valid_ages = [ages[-1] for ages, ok in zip(psens_age_us, psens_ok)
+                      if ok[-1] and ages[-1] >= 0]
+        age_text = (f"{max(valid_ages) / 1000.0:.2f} ms"
+                    if valid_ages else "unavailable")
+        press_status.set_text(
+            f"sensors ok: {ok_count}/{NUM_PSENS}   "
+            f"avg temp: {psens_temp_avg[-1]:5.1f} C   "
+            f"max valid age: {age_text}"
+        )
+        return tuple(press_lines)
+
+    anims = [
+        animation.FuncAnimation(fig_flow, update_flow, interval=80,
+                                blit=False, cache_frame_data=False),
+        animation.FuncAnimation(fig_act, update_act, interval=80,
+                                blit=False, cache_frame_data=False),
+        animation.FuncAnimation(fig_press, update_press, interval=80,
+                                blit=False, cache_frame_data=False),
+    ]
+
+    for fig in (fig_flow, fig_act, fig_press):
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+
+    try:
+        plt.show()  # blocks until all three windows are closed
+    except KeyboardInterrupt:
+        pass
+    finally:
+        del anims
+        link.close()
+
+
+if __name__ == "__main__":
+    main()
